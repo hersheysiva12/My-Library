@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Next.js Dev Server",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "C:\\Users\\hsiva\\run-mylibrary.bat"],
+      "port": 3000,
+      "autoPort": true
+    }
+  ]
+}
