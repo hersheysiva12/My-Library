@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Search, Plus, Loader2 } from "lucide-react";
 import { Book } from "@/app/types";
+import { gradientPalette } from "@/lib/gradients";
 
 interface GoogleBooksResult {
   id: string;
@@ -15,16 +16,9 @@ interface GoogleBooksResult {
 
 interface SearchBarProps {
   onAddBook: (book: Book) => void;
+  /** Google Books IDs already in the library — shown as already added. */
+  existingGoogleIds?: string[];
 }
-
-// Cycles through a palette of cover styles for API results that have no cover image
-const gradientPalette = [
-  { coverGradient: "linear-gradient(160deg, #4a1942 0%, #2d0d2a 40%, #6b2560 100%)", glowColor: "rgba(140,40,150,0.7)", spineColor: "#4a1942", accentColor: "#e879f9" },
-  { coverGradient: "linear-gradient(160deg, #1a3a4a 0%, #0d2030 40%, #1e4f6b 100%)", glowColor: "rgba(30,100,160,0.7)", spineColor: "#1a3a4a", accentColor: "#7dd3fc" },
-  { coverGradient: "linear-gradient(160deg, #2d3a0d 0%, #1a2206 40%, #3d5010 100%)", glowColor: "rgba(80,140,20,0.7)", spineColor: "#2d3a0d", accentColor: "#a3e635" },
-  { coverGradient: "linear-gradient(160deg, #4a2a0d 0%, #2d1806 40%, #6b3e10 100%)", glowColor: "rgba(160,90,20,0.7)", spineColor: "#4a2a0d", accentColor: "#fdba74" },
-  { coverGradient: "linear-gradient(160deg, #0d2a3a 0%, #061820 40%, #0f3d52 100%)", glowColor: "rgba(20,100,130,0.7)", spineColor: "#0d2a3a", accentColor: "#5eead4" },
-];
 
 let paletteIndex = 0;
 function nextPaletteEntry() {
@@ -33,7 +27,7 @@ function nextPaletteEntry() {
   return entry;
 }
 
-export default function SearchBar({ onAddBook }: SearchBarProps) {
+export default function SearchBar({ onAddBook, existingGoogleIds = [] }: SearchBarProps) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<GoogleBooksResult[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -73,7 +67,6 @@ export default function SearchBar({ onAddBook }: SearchBarProps) {
   function handleAdd(item: GoogleBooksResult) {
     const { volumeInfo } = item;
     const rawThumb = volumeInfo.imageLinks?.thumbnail ?? volumeInfo.imageLinks?.smallThumbnail;
-    // Upgrade to https to avoid mixed-content warnings
     const coverUrl = rawThumb ? rawThumb.replace(/^http:\/\//, "https://") : undefined;
 
     const palette = nextPaletteEntry();
@@ -83,7 +76,7 @@ export default function SearchBar({ onAddBook }: SearchBarProps) {
       author: volumeInfo.authors?.[0] ?? "Unknown Author",
       coverUrl,
       ...palette,
-      status: "tbr",
+      status: "owned",
     };
     onAddBook(book);
     setAddedIds((prev) => new Set(prev).add(item.id));
@@ -144,7 +137,7 @@ export default function SearchBar({ onAddBook }: SearchBarProps) {
               const { volumeInfo } = item;
               const thumb = volumeInfo.imageLinks?.smallThumbnail?.replace(/^http:\/\//, "https://");
               const author = volumeInfo.authors?.[0] ?? "Unknown Author";
-              const added = addedIds.has(item.id);
+              const added = addedIds.has(item.id) || existingGoogleIds.includes(item.id);
 
               return (
                 <div
@@ -189,7 +182,7 @@ export default function SearchBar({ onAddBook }: SearchBarProps) {
                     </p>
                   </div>
 
-                  {/* Add button */}
+                  {/* Add / Already added button */}
                   <button
                     className="shrink-0 w-6 h-6 rounded-full flex items-center justify-center transition-all"
                     style={{
