@@ -5,6 +5,14 @@ import { Search, Plus, Loader2 } from "lucide-react";
 import { Book } from "@/app/types";
 import { gradientPalette } from "@/lib/gradients";
 
+/** Strip the page-curl effect and upgrade to a higher-res flat cover. */
+function cleanCoverUrl(raw: string): string {
+  return raw
+    .replace(/^http:\/\//, "https://")
+    .replace(/&edge=curl/g, "")
+    .replace(/zoom=1(&|$)/, "zoom=5$1");
+}
+
 interface GoogleBooksResult {
   id: string;
   volumeInfo: {
@@ -67,7 +75,7 @@ export default function SearchBar({ onAddBook, existingGoogleIds = [] }: SearchB
   function handleAdd(item: GoogleBooksResult) {
     const { volumeInfo } = item;
     const rawThumb = volumeInfo.imageLinks?.thumbnail ?? volumeInfo.imageLinks?.smallThumbnail;
-    const coverUrl = rawThumb ? rawThumb.replace(/^http:\/\//, "https://") : undefined;
+    const coverUrl = rawThumb ? cleanCoverUrl(rawThumb) : undefined;
 
     const palette = nextPaletteEntry();
     const book: Book = {
@@ -76,7 +84,7 @@ export default function SearchBar({ onAddBook, existingGoogleIds = [] }: SearchB
       author: volumeInfo.authors?.[0] ?? "Unknown Author",
       coverUrl,
       ...palette,
-      status: "owned",
+      status: "tbr-owned",
     };
     onAddBook(book);
     setAddedIds((prev) => new Set(prev).add(item.id));
@@ -100,7 +108,7 @@ export default function SearchBar({ onAddBook, existingGoogleIds = [] }: SearchB
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={handleKeyDown}
           onFocus={() => results.length > 0 && setIsOpen(true)}
-          placeholder="Search for a book… press Enter"
+          placeholder="Search by title or author… press Enter"
           className="flex-1 bg-transparent outline-none text-sm placeholder:opacity-40"
           style={{
             fontFamily: "var(--font-crimson)",
@@ -135,7 +143,8 @@ export default function SearchBar({ onAddBook, existingGoogleIds = [] }: SearchB
           ) : (
             results.map((item) => {
               const { volumeInfo } = item;
-              const thumb = volumeInfo.imageLinks?.smallThumbnail?.replace(/^http:\/\//, "https://");
+              const rawThumbSmall = volumeInfo.imageLinks?.thumbnail ?? volumeInfo.imageLinks?.smallThumbnail;
+              const thumb = rawThumbSmall ? cleanCoverUrl(rawThumbSmall) : undefined;
               const author = volumeInfo.authors?.[0] ?? "Unknown Author";
               const added = addedIds.has(item.id) || existingGoogleIds.includes(item.id);
 
