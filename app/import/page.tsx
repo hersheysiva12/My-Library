@@ -31,6 +31,7 @@ interface IsbnBook {
   coverUrl: string | null;
   googleBooksId: string;
   year: string | null;
+  pageCount: number | null;
 }
 
 interface InsertRow {
@@ -41,6 +42,7 @@ interface InsertRow {
   status: string;
   date_finished: string | null;
   format: string;
+  page_count: number | null;
   shelf_number: number;
   sort_order: number;
 }
@@ -530,21 +532,22 @@ export default function ImportPage() {
   }
 
   /* ── CSV: cover fetch per row ── */
-  async function fetchCoverForRow(row: GoodreadsRow): Promise<{ cover_url: string | null; google_books_id: string | null }> {
+  async function fetchCoverForRow(row: GoodreadsRow): Promise<{ cover_url: string | null; google_books_id: string | null; page_count: number | null }> {
     const isbn = stripIsbn(row.ISBN);
     const q = isbn ? `isbn:${isbn}` : `${row.Title} ${row.Author}`;
     try {
       const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
       const data = await res.json();
       const item = data.items?.[0];
-      if (!item) return { cover_url: null, google_books_id: null };
+      if (!item) return { cover_url: null, google_books_id: null, page_count: null };
       const raw: string | undefined = item.volumeInfo?.imageLinks?.thumbnail ?? item.volumeInfo?.imageLinks?.smallThumbnail;
       return {
         cover_url: raw ? cleanCoverUrl(raw) : null,
         google_books_id: item.id ?? null,
+        page_count: item.volumeInfo?.pageCount ?? null,
       };
     } catch {
-      return { cover_url: null, google_books_id: null };
+      return { cover_url: null, google_books_id: null, page_count: null };
     }
   }
 
@@ -584,7 +587,7 @@ export default function ImportPage() {
     for (const chunk of chunkArray(rowsToImport, 10)) {
       const covers = await Promise.all(chunk.map(fetchCoverForRow));
       for (let i = 0; i < chunk.length; i++) {
-        const { cover_url, google_books_id } = covers[i];
+        const { cover_url, google_books_id, page_count } = covers[i];
         if (cover_url) coverCount++;
         allRows.push({
           title: stripSeriesFromTitle(chunk[i].Title.trim()),
@@ -594,6 +597,7 @@ export default function ImportPage() {
           status: mapStatus(chunk[i]),
           date_finished: convertDate(chunk[i]["Date Read"]),
           format: "physical",
+          page_count,
         });
       }
       setImportDone((prev) => prev + chunk.length);
@@ -636,6 +640,7 @@ export default function ImportPage() {
         coverUrl: raw ? cleanCoverUrl(raw) : null,
         googleBooksId: item.id,
         year: vi.publishedDate?.substring(0, 4) ?? null,
+        pageCount: vi.pageCount ?? null,
       });
     } finally {
       setIsbnLoading(false);
@@ -669,6 +674,7 @@ export default function ImportPage() {
       status: isbnStatus,
       format,
       format_source,
+      page_count: isbnResult.pageCount ?? null,
     });
     router.push("/");
   }
@@ -697,7 +703,7 @@ export default function ImportPage() {
       data.map((b) => ({
         title: "", author: b.author ?? null,
         cover_url: null, google_books_id: null,
-        status: "", date_finished: null, format: "",
+        status: "", date_finished: null, format: "", page_count: null,
       }))
     );
 
@@ -840,7 +846,7 @@ export default function ImportPage() {
     for (const chunk of chunkArray(toImport, 10)) {
       const covers = await Promise.all(chunk.map(fetchCoverForRow));
       for (let i = 0; i < chunk.length; i++) {
-        const { cover_url, google_books_id } = covers[i];
+        const { cover_url, google_books_id, page_count } = covers[i];
         if (cover_url) coverCount++;
         allRows.push({
           title: stripSeriesFromTitle(chunk[i].Title.trim()),
@@ -849,6 +855,7 @@ export default function ImportPage() {
           status: mapStatus(chunk[i]),
           date_finished: convertDate(chunk[i]["Date Read"]),
           format: "physical",
+          page_count,
         });
       }
       setRefreshDone((prev) => prev + chunk.length);

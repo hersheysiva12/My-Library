@@ -64,6 +64,7 @@ export default function BookDetailPanel({ book, onUpdate, onDelete, onClose, sav
   const [seriesName, setSeriesName]     = useState(book.seriesName ?? "");
   const [seriesPos, setSeriesPos]       = useState(book.seriesPosition?.toString() ?? "");
   const [seriesTotal, setSeriesTotal]   = useState(book.seriesTotal?.toString() ?? "");
+  const [pageCountDraft, setPageCountDraft] = useState(book.pageCount?.toString() ?? "");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [showSaved, setShowSaved]       = useState(false);
   const [starHover, setStarHover]       = useState(0);
@@ -77,6 +78,7 @@ export default function BookDetailPanel({ book, onUpdate, onDelete, onClose, sav
     setSeriesName(book.seriesName ?? "");
     setSeriesPos(book.seriesPosition?.toString() ?? "");
     setSeriesTotal(book.seriesTotal?.toString() ?? "");
+    setPageCountDraft(book.pageCount?.toString() ?? "");
     setConfirmDelete(false);
     setStarHover(0);
   }, [book.id]);
@@ -410,6 +412,26 @@ export default function BookDetailPanel({ book, onUpdate, onDelete, onClose, sav
             </div>
           </div>
         )}
+
+        {DIVIDER}
+
+        {/* Page Count */}
+        <div>
+          <label style={LABEL}>Page Count</label>
+          <input
+            type="number"
+            min={1}
+            max={9999}
+            placeholder="e.g. 324"
+            value={pageCountDraft}
+            onChange={e => setPageCountDraft(e.target.value)}
+            onBlur={() => onUpdate({ pageCount: pageCountDraft ? Number(pageCountDraft) : undefined })}
+            style={INPUT}
+          />
+          <p style={{ marginTop: "5px", fontSize: "11px", color: "rgba(255,255,255,0.3)", fontFamily: "var(--font-crimson)", margin: "5px 0 0" }}>
+            Affects spine width on the shelf
+          </p>
+        </div>
 
         {DIVIDER}
 

@@ -18,6 +18,7 @@ interface GoogleBooksResult {
   volumeInfo: {
     title: string;
     authors?: string[];
+    pageCount?: number;
     imageLinks?: { thumbnail?: string; smallThumbnail?: string };
   };
 }
@@ -83,6 +84,7 @@ export default function SearchBar({ onAddBook, existingGoogleIds = [] }: SearchB
       title: volumeInfo.title,
       author: volumeInfo.authors?.[0] ?? "Unknown Author",
       coverUrl,
+      pageCount: volumeInfo.pageCount,
       ...palette,
       status: "tbr-owned",
     };

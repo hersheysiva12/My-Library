@@ -31,6 +31,7 @@ function dbRowToBook(row: DbBook, index: number): Book {
     seriesPosition: row.series_position ?? undefined,
     seriesTotal:  row.series_total  ?? undefined,
     returnDate:   row.return_date   ?? undefined,
+    pageCount:    row.page_count    ?? undefined,
     shelfNumber:  row.shelf_number  ?? 0,
     ...palette,
   };
@@ -77,7 +78,13 @@ function BookSpine({ book, isSelected, onSelect, onOpenDetail }: {
 }) {
   const heightSeed = book.seriesName ?? book.title;
   const bookH = 145 + (heightSeed.charCodeAt(0) + heightSeed.length) % 42; // 145–186px
-  const bookW = 30 + (book.author.charCodeAt(0) % 10); // 30–39px
+  const bookW = calcSpineWidth(book);
+  const spineFontSize = bookW >= 62 ? 11 : bookW >= 42 ? 10 : 9;
+  const wordCount = book.title.split(" ").length;
+  const titleFontSize = wordCount >= 6 ? Math.max(7, spineFontSize - 2)
+                      : wordCount >= 4 ? Math.max(8, spineFontSize - 1)
+                      : spineFontSize;
+  const authorFontSize = Math.max(7, spineFontSize - 2);
 
   return (
     <div
@@ -122,22 +129,36 @@ function BookSpine({ book, isSelected, onSelect, onOpenDetail }: {
           <div style={{ position: "absolute", top: "8px", left: "4px", right: "4px", height: "1px", background: book.accentColor, opacity: 0.5 }} />
           {/* Bottom rule */}
           <div style={{ position: "absolute", bottom: "8px", left: "4px", right: "4px", height: "1px", background: book.accentColor, opacity: 0.5 }} />
-          {/* Title + author */}
-          <div style={{ position: "absolute", inset: "18px 0", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "4px" }}>
-            <p style={{
+          {/* Title — fills space from top rule down to author zone */}
+          <div style={{ position: "absolute", top: "18px", left: 0, right: 0, bottom: "60px", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <p title={book.title} style={{
               writingMode: "vertical-rl", transform: "rotate(180deg)",
-              fontFamily: "var(--font-cinzel)", fontSize: "7.5px",
+              fontFamily: "var(--font-cinzel)", fontSize: `${titleFontSize}px`,
               color: book.accentColor, letterSpacing: "0.08em",
-              textAlign: "center", maxHeight: "90px", overflow: "hidden",
+              textAlign: "center", maxHeight: "100%",
+              overflow: "hidden", margin: 0,
               textShadow: `0 0 8px ${book.accentColor}80`, lineHeight: 1.2,
             }}>{book.title}</p>
+          </div>
+          {/* Author — always pinned above the bottom rule */}
+          <div style={{ position: "absolute", bottom: "12px", left: 0, right: 0, height: "44px", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }}>
             <p style={{
               writingMode: "vertical-rl", transform: "rotate(180deg)",
-              fontFamily: "var(--font-crimson)", fontSize: "7px",
+              fontFamily: "var(--font-crimson)", fontSize: `${authorFontSize}px`,
               color: book.accentColor, opacity: 0.65, letterSpacing: "0.04em",
-              textAlign: "center", maxHeight: "60px", overflow: "hidden", fontStyle: "italic",
+              textAlign: "center", maxHeight: "44px",
+              overflow: "hidden", margin: 0, fontStyle: "italic", lineHeight: 1.2,
             }}>{book.author}</p>
           </div>
+          {/* Unknown page count indicator */}
+          {book.pageCount == null && (
+            <div style={{
+              position: "absolute", bottom: "58px", right: "3px",
+              fontFamily: "var(--font-cinzel)", fontSize: "7px",
+              color: book.accentColor, opacity: 0.4, lineHeight: 1,
+              pointerEvents: "none",
+            }}>?</div>
+          )}
         </div>
 
         {/* ══ BACK: Cover ══ */}
@@ -833,9 +854,15 @@ function toShelves(books: Book[]): Book[][] {
   return result;
 }
 
-/** Matches the BookSpine render formula exactly: 30–39px */
+/** Returns spine width based on page count tiers. */
 function calcSpineWidth(book: Book): number {
-  return 30 + (book.author?.charCodeAt(0) ?? 65) % 10;
+  const p = book.pageCount;
+  if (p == null) return 44; // unknown — default
+  if (p < 200)  return 32; // slim
+  if (p < 350)  return 42; // standard
+  if (p < 500)  return 52; // chunky
+  if (p < 700)  return 62; // thick
+  return 72;               // doorstopper
 }
 function shelfTotalWidth(shelf: Book[]): number {
   return shelf.reduce((sum, b) => sum + calcSpineWidth(b), 0);
@@ -1084,6 +1111,67 @@ export default function HomePage() {
     });
   }, [books]);
 
+  // Backfill page counts from Google Books for books that don't have one yet
+  const backfillDoneRef = useRef(false);
+  useEffect(() => {
+    if (backfillDoneRef.current || books.length === 0) return;
+    backfillDoneRef.current = true;
+
+    const needsCount = books.filter(b => b.pageCount == null);
+    if (needsCount.length === 0) return;
+
+    async function backfill() {
+      const BATCH = 5;
+      const upserts: { id: string; page_count: number }[] = [];
+
+      for (let i = 0; i < needsCount.length; i += BATCH) {
+        const chunk = needsCount.slice(i, i + BATCH);
+        await Promise.all(chunk.map(async (book) => {
+          let pageCount: number | null = null;
+
+          // Try direct Google Books volume lookup first
+          if (book.googleBooksId) {
+            try {
+              const res = await fetch(`/api/books/${encodeURIComponent(book.googleBooksId)}`);
+              if (res.ok) pageCount = (await res.json()).pageCount ?? null;
+            } catch { /* ignore */ }
+          }
+
+          // Fall back to title+author search (handles OverDrive IDs and missing IDs)
+          if (!pageCount) {
+            try {
+              const q = encodeURIComponent(`${book.title} ${book.author ?? ""}`.trim());
+              const res = await fetch(`/api/search?q=${q}`);
+              if (res.ok) {
+                const d = await res.json();
+                pageCount = d.items?.[0]?.volumeInfo?.pageCount ?? null;
+              }
+            } catch { /* ignore */ }
+          }
+
+          if (pageCount) {
+            upserts.push({ id: String(book.id), page_count: pageCount });
+            setBooks(prev => prev.map(b => b.id === book.id ? { ...b, pageCount: pageCount! } : b));
+          }
+        }));
+
+        if (i + BATCH < needsCount.length) await new Promise(r => setTimeout(r, 250));
+      }
+
+      if (upserts.length > 0) {
+        await supabase.from("books").upsert(upserts, { onConflict: "id" });
+        setBooks(prev => {
+          const recomputed = recomputeGrouping(prev, shelfWidthPx);
+          persistGrouping(recomputed);
+          return recomputed;
+        });
+      }
+    }
+
+    backfill();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [books.length]);
+
 
   async function handleAddBook(book: Book) {
     const googleId = book.id as string;
@@ -1113,6 +1201,7 @@ export default function HomePage() {
     const { data, error } = await supabase.from("books")
       .insert({ title: book.title, author: book.author, cover_url: book.coverUrl ?? null,
                 google_books_id: googleId, status: "tbr-owned",
+                page_count: book.pageCount ?? null,
                 shelf_number: targetShelf, sort_order: shelfPosition })
       .select().single();
     if (error) {
@@ -1143,10 +1232,11 @@ export default function HomePage() {
     if ("seriesPosition" in updates) db.series_position = updates.seriesPosition ?? null;
     if ("seriesTotal"    in updates) db.series_total    = updates.seriesTotal   ?? null;
     if ("returnDate"     in updates) db.return_date     = updates.returnDate    ?? null;
+    if ("pageCount"      in updates) db.page_count      = updates.pageCount     ?? null;
     const { error } = await supabase.from("books").update(db).eq("id", id);
     if (!error) {
       setSavedTs(Date.now());
-      if ("seriesName" in updates || "seriesPosition" in updates) {
+      if ("seriesName" in updates || "seriesPosition" in updates || "pageCount" in updates) {
         const updatedBooks = books.map(b => b.id === id ? { ...b, ...updates } : b);
         const recomputed = recomputeGrouping(updatedBooks, shelfWidthPx);
         setBooks(recomputed);

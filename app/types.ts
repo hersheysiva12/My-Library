@@ -20,6 +20,7 @@ export interface Book {
   seriesPosition?: number;
   seriesTotal?: number;
   returnDate?: string;         // for Libby loans
+  pageCount?: number;
   shelfNumber?: number;
 }
 
@@ -45,4 +46,5 @@ export interface DbBook {
   sort_order: number | null;
   shelf_number: number | null;
   tbr_order: number | null;
+  page_count: number | null;
 }
