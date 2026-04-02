@@ -1,24 +1,26 @@
-const BASE = "https://sentry-read.svc.overdrive.com";
-const UA = "OverDrive Media Console";
+import { request, Agent } from "undici";
 
-async function safeJson(res: Response): Promise<Record<string, unknown>> {
-  try {
-    const text = await res.text();
-    if (!text.trim()) return {};
-    return JSON.parse(text);
-  } catch {
-    return {};
-  }
-}
+const BASE_HOST = "sentry-read.svc.overdrive.com";
+const UA = "OverDrive Media Console";
+const agent = new Agent({ connect: { rejectUnauthorized: false } });
 
 export async function GET(req: Request) {
   const auth = req.headers.get("authorization");
   if (!auth) return Response.json({ error: "No authorization header" }, { status: 401 });
 
-  const res = await fetch(`${BASE}/chip/sync`, {
-    headers: { Authorization: auth, "User-Agent": UA, Accept: "application/json" },
-  });
-  const data = await safeJson(res);
-  if (!res.ok) return Response.json({ error: "Failed to fetch loans" }, { status: res.status });
-  return Response.json({ loans: data.loans ?? [] });
+  try {
+    const resp = await request(`https://${BASE_HOST}/chip/sync`, {
+      method: "GET",
+      headers: { Authorization: auth, "User-Agent": UA, Accept: "application/json" },
+      dispatcher: agent,
+    });
+    let text = "";
+    for await (const chunk of resp.body) text += chunk;
+    const data = text.trim() ? JSON.parse(text) : {};
+    if (resp.statusCode < 200 || resp.statusCode >= 300)
+      return Response.json({ error: "Failed to fetch loans" }, { status: resp.statusCode });
+    return Response.json({ loans: data.loans ?? [] });
+  } catch (err) {
+    return Response.json({ error: "Network error", debug: String(err) }, { status: 502 });
+  }
 }

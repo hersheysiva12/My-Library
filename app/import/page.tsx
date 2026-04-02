@@ -77,10 +77,11 @@ interface ODHold {
   seriesInfo?: { name: string; readingOrder?: number; totalCount?: number };
 }
 
-function odFormat(formats?: { id: string }[]): { format: string; format_source: string } {
+function odFormat(formats?: { id: string }[]): { format: string | null; format_source: string } {
   const ids = (formats ?? []).map((f) => f.id);
   if (ids.some((id) => id.startsWith("audiobook"))) return { format: "audiobook", format_source: "libby-loan" };
-  return { format: "ebook", format_source: "libby-loan" };
+  // "ebook" may not pass the DB check constraint — store null, identify via format_source
+  return { format: null, format_source: "libby-loan" };
 }
 
 function odCover(covers?: ODLoan["covers"]): string | null {
@@ -88,10 +89,16 @@ function odCover(covers?: ODLoan["covers"]): string | null {
   return raw ? raw.replace(/^http:\/\//, "https://") : null;
 }
 
+function odTitle(t: ODLoan["title"] | undefined): string {
+  if (!t) return "Unknown Title";
+  if (typeof t === "string") return t as string;
+  return (t as { text?: string }).text ?? "Unknown Title";
+}
+
 function mapLoanToRow(l: ODLoan) {
   const { format, format_source } = odFormat(l.formats);
   return {
-    title: l.title.text,
+    title: odTitle(l.title),
     author: l.firstCreatorName ?? "Unknown",
     cover_url: odCover(l.covers),
     google_books_id: l.id,
@@ -106,16 +113,15 @@ function mapLoanToRow(l: ODLoan) {
 }
 
 function mapHoldToRow(h: ODHold) {
-  const ids = (h.formats ?? []).map((f) => f.id);
-  const format = ids.some((id) => id.startsWith("audiobook")) ? "audiobook" : "ebook";
+  const { format, format_source } = odFormat(h.formats);
   return {
-    title: h.title.text,
+    title: odTitle(h.title),
     author: h.firstCreatorName ?? "Unknown",
     cover_url: odCover(h.covers),
     google_books_id: h.id,
     status: "tbr-not-owned",
     format,
-    format_source: "libby-hold",
+    format_source: format_source.replace("loan", "hold"),
     series_name: h.seriesInfo?.name ?? null,
     series_position: h.seriesInfo?.readingOrder ?? null,
     series_total: h.seriesInfo?.totalCount ?? null,
@@ -302,15 +308,13 @@ export default function ImportPage() {
 
   /* Libby */
   const [libbyToken, setLibbyToken] = useState<string | null>(null);
-  const [libbyCode, setLibbyCode] = useState<string | null>(null);
-  const [libbyCodeExpiry, setLibbyCodeExpiry] = useState(0); // seconds remaining
+  const [libbyInputCode, setLibbyInputCode] = useState(""); // code the user types from Libby
   const [libbyCards, setLibbyCards] = useState<{ advantageKey: string; websiteId: number; cardName: string }[]>([]);
   const [selectedCardKey, setSelectedCardKey] = useState<string | null>(null);
   const [libbyPhase, setLibbyPhase] = useState<"setup" | "code" | "importing" | "done">("setup");
   const [libbyLoansSynced, setLibbyLoansSynced] = useState(0);
   const [libbyHoldsSynced, setLibbyHoldsSynced] = useState(0);
   const [libbyError, setLibbyError] = useState<string | null>(null);
-  const libbyPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   /* CSV */
   const [parsedRows, setParsedRows] = useState<GoodreadsRow[]>([]);
@@ -415,77 +419,70 @@ export default function ImportPage() {
     const loanRows = loans.filter((l) => !existingIds.has(l.id)).map(mapLoanToRow);
     const holdRows = holds.filter((h) => !existingIds.has(h.id)).map(mapHoldToRow);
 
-    if (loanRows.length > 0) await supabase.from("books").insert(loanRows);
-    if (holdRows.length > 0) await supabase.from("books").insert(holdRows);
+    if (loanRows.length > 0) {
+      const { error: le } = await supabase.from("books").insert(loanRows);
+      if (le) console.error("[libby insert loans]", le.message, le.details, le.hint);
+    }
+    if (holdRows.length > 0) {
+      const { error: he } = await supabase.from("books").insert(holdRows);
+      if (he) console.error("[libby insert holds]", he.message, he.details, he.hint);
+    }
 
     setLibbyLoansSynced(loanRows.length);
     setLibbyHoldsSynced(holdRows.length);
+    // Repack shelves so newly added books get proper shelf_number/sort_order
+    await handleRepackShelves();
     setLibbyPhase("done");
   }
 
   async function handleLibbyConnect() {
     setLibbyError(null);
     setLibbyPhase("code");
+    setLibbyInputCode("");
 
     const res = await fetch("/api/libby/auth", { method: "POST" });
     const data = await safeJson(res);
 
-    if (!res.ok || !data.token || !data.code) {
+    if (!res.ok || !data.token) {
       const dbg = data.debug ? ` [${JSON.stringify(data.debug)}]` : "";
       setLibbyError(((data.error as string) ?? "Could not reach Libby servers. Try again.") + dbg);
       setLibbyPhase("setup");
       return;
     }
 
-    const token = data.token as string;
-    const code = data.code as string;
-    const expiresIn = (data.expiresIn as number) ?? 60;
+    setLibbyToken(data.token as string);
+  }
 
-    setLibbyToken(token);
-    setLibbyCode(code);
-    setLibbyCodeExpiry(expiresIn);
+  async function handleLibbyClone() {
+    if (!libbyToken || !libbyInputCode.trim()) return;
+    setLibbyError(null);
+    setLibbyPhase("importing");
 
-    // Countdown timer
-    let remaining = expiresIn;
-    const countdown = setInterval(() => {
-      remaining -= 1;
-      setLibbyCodeExpiry(remaining);
-      if (remaining <= 0) clearInterval(countdown);
-    }, 1000);
+    const res = await fetch("/api/libby/clone", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: libbyToken, code: libbyInputCode.trim() }),
+    });
+    const data = await safeJson(res);
+    console.log("[libby clone]", JSON.stringify({ cards: data.cards, loansCount: (data.loans as unknown[])?.length, holdsCount: (data.holds as unknown[])?.length, debug: data.debug }));
 
-    // Poll for sync completion every 2 seconds
-    let attempts = 0;
-    const maxAttempts = Math.ceil(expiresIn / 2) + 5;
-    libbyPollRef.current = setInterval(async () => {
-      attempts++;
-      if (attempts > maxAttempts) {
-        clearInterval(libbyPollRef.current!);
-        clearInterval(countdown);
-        setLibbyError("Code expired. Click Connect again to generate a new one.");
-        setLibbyPhase("setup");
-        return;
-      }
-      try {
-        const pollRes = await fetch("/api/libby/poll", {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        const pollData = await safeJson(pollRes);
-        if (pollData.synchronized) {
-          clearInterval(libbyPollRef.current!);
-          clearInterval(countdown);
-          const cards = (pollData.cards as typeof libbyCards) ?? [];
-          const cardKey = cards[0]?.advantageKey ?? null;
-          setLibbyCards(cards);
-          setSelectedCardKey(cardKey);
-          localStorage.setItem("libbyAuth", JSON.stringify({ token, cards, selectedCardKey: cardKey }));
-          setLibbyPhase("importing");
-          await importLibbyData(
-            (pollData.loans as ODLoan[]) ?? [],
-            (pollData.holds as ODHold[]) ?? []
-          );
-        }
-      } catch { /* keep polling */ }
-    }, 2000);
+    if (!res.ok) {
+      const dbg = data.debug ? ` [${JSON.stringify(data.debug)}]` : "";
+      setLibbyError(((data.error as string) ?? "Clone failed. Check the code and try again.") + dbg);
+      setLibbyPhase("code");
+      return;
+    }
+
+    const cards = (data.cards as typeof libbyCards) ?? [];
+    const cardKey = cards[0]?.advantageKey ?? null;
+    setLibbyCards(cards);
+    setSelectedCardKey(cardKey);
+    localStorage.setItem("libbyAuth", JSON.stringify({ token: libbyToken, cards, selectedCardKey: cardKey }));
+
+    await importLibbyData(
+      (data.loans as ODLoan[]) ?? [],
+      (data.holds as ODHold[]) ?? []
+    );
   }
 
   async function handleReSync() {
@@ -1825,7 +1822,7 @@ export default function ImportPage() {
                 borderRadius: "8px",
               }}>
                 <span style={{ fontFamily: "var(--font-crimson)", fontSize: "14px", color: "#6dcc9a" }}>
-                  ✓ Connected to {libbyCardLabel(selectedCardKey)}
+                  ✓ Connected to Libby{libbyCards.length > 1 ? ` · ${libbyCards.length} library cards` : libbyCards.length === 1 ? ` · ${libbyCards[0].cardName}` : ""}
                 </span>
                 <button
                   onClick={() => { setLibbyToken(null); setLibbyCards([]); setSelectedCardKey(null); localStorage.removeItem("libbyAuth"); }}
@@ -1862,30 +1859,40 @@ export default function ImportPage() {
               </div>
             )}
 
-            {/* Code display phase — waiting for user to enter code in Libby */}
-            {libbyPhase === "code" && libbyCode && (
+            {/* Code entry phase — user reads code from Libby and types it here */}
+            {libbyPhase === "code" && (
               <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
-                <div style={{
-                  padding: "24px", background: "rgba(212,168,67,0.06)",
-                  border: "1px solid rgba(212,168,67,0.3)", borderRadius: "12px",
-                  textAlign: "center",
-                }}>
-                  <p style={{ fontFamily: "var(--font-cinzel)", fontSize: "9px", letterSpacing: "0.2em", textTransform: "uppercase", color: "rgba(212,168,67,0.6)", marginBottom: "12px" }}>
-                    Enter this code in Libby
-                  </p>
-                  <div style={{ fontFamily: "var(--font-cinzel)", fontSize: "36px", letterSpacing: "0.35em", color: "#f0e0c0", marginBottom: "12px" }}>
-                    {libbyCode}
-                  </div>
-                  <p style={{ fontFamily: "var(--font-crimson)", fontSize: "12px", color: libbyCodeExpiry <= 10 ? "#f87171" : "rgba(240,224,192,0.35)" }}>
-                    {libbyCodeExpiry > 0 ? `Expires in ${libbyCodeExpiry}s` : "Code expired"}
-                  </p>
+                <div style={{ fontFamily: "var(--font-crimson)", fontSize: "14px", color: "rgba(240,224,192,0.7)", lineHeight: 1.8 }}>
+                  <strong style={{ color: "rgba(240,224,192,0.9)", fontStyle: "normal" }}>In Libby:</strong> Copy To Another Device → choose <strong style={{ color: "#d4a843", fontStyle: "normal" }}>Sonos Speaker</strong> (or any listed device) → Libby will display an 8-digit code.
                 </div>
-                <div style={{ fontFamily: "var(--font-crimson)", fontSize: "14px", color: "rgba(240,224,192,0.6)", lineHeight: 1.7 }}>
-                  <strong style={{ color: "rgba(240,224,192,0.85)", fontStyle: "normal" }}>In Libby:</strong> Copy To Another Device → &ldquo;Tap here to enter the code&rdquo; → type the code above.
+                <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                  <label style={{ fontFamily: "var(--font-cinzel)", fontSize: "9px", letterSpacing: "0.2em", textTransform: "uppercase", color: "rgba(212,168,67,0.6)" }}>
+                    Enter code from Libby
+                  </label>
+                  <input
+                    value={libbyInputCode}
+                    onChange={(e) => setLibbyInputCode(e.target.value.replace(/\D/g, "").slice(0, 8))}
+                    placeholder="12345678"
+                    maxLength={8}
+                    style={{
+                      fontFamily: "var(--font-cinzel)", fontSize: "28px", letterSpacing: "0.3em",
+                      background: "rgba(212,168,67,0.06)", border: "1px solid rgba(212,168,67,0.3)",
+                      borderRadius: "8px", padding: "16px 20px", color: "#f0e0c0",
+                      outline: "none", width: "100%", textAlign: "center",
+                    }}
+                  />
                 </div>
-                <div style={{ display: "flex", alignItems: "center", gap: "10px", fontFamily: "var(--font-cinzel)", fontSize: "10px", letterSpacing: "0.12em", color: "rgba(240,224,192,0.35)" }}>
-                  <Loader2 size={13} className="animate-spin" />
-                  Waiting for Libby to confirm…
+                <div style={{ display: "flex", gap: "10px" }}>
+                  <button
+                    onClick={handleLibbyClone}
+                    disabled={libbyInputCode.length < 8}
+                    style={{ ...GOLD_BUTTON, opacity: libbyInputCode.length < 8 ? 0.4 : 1 }}
+                  >
+                    Sync Library
+                  </button>
+                  <button onClick={() => setLibbyPhase("setup")} style={{ ...GOLD_BUTTON, background: "none", borderColor: "rgba(212,168,67,0.2)", color: "rgba(212,168,67,0.4)" }}>
+                    Cancel
+                  </button>
                 </div>
               </div>
             )}
@@ -1907,7 +1914,7 @@ export default function ImportPage() {
                   </p>
                   <p style={{ fontFamily: "var(--font-crimson)", fontSize: "15px", color: "rgba(240,224,192,0.75)" }}>
                     {libbyLoansSynced > 0 || libbyHoldsSynced > 0
-                      ? `${libbyLoansSynced} active loan${libbyLoansSynced !== 1 ? "s" : ""} and ${libbyHoldsSynced} hold${libbyHoldsSynced !== 1 ? "s" : ""} synced from ${libbyCardLabel(selectedCardKey)}.`
+                      ? `${libbyLoansSynced} active loan${libbyLoansSynced !== 1 ? "s" : ""} and ${libbyHoldsSynced} hold${libbyHoldsSynced !== 1 ? "s" : ""} synced from your Libby account${libbyCards.length > 1 ? ` (${libbyCards.length} library cards)` : libbyCards.length === 1 ? ` (${libbyCards[0].cardName})` : ""}.`
                       : "No new books — your library is already up to date."}
                   </p>
                 </div>
