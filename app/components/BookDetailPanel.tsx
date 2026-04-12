@@ -65,9 +65,46 @@ export default function BookDetailPanel({ book, onUpdate, onDelete, onClose, sav
   const [seriesPos, setSeriesPos]       = useState(book.seriesPosition?.toString() ?? "");
   const [seriesTotal, setSeriesTotal]   = useState(book.seriesTotal?.toString() ?? "");
   const [pageCountDraft, setPageCountDraft] = useState(book.pageCount?.toString() ?? "");
+  const [seriesStatusDraft, setSeriesStatusDraft] = useState<string>(book.seriesStatus ?? "unknown");
+  const [releaseDateDraft, setReleaseDateDraft] = useState(book.nextBookReleaseDate ?? "");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [showSaved, setShowSaved]       = useState(false);
   const [starHover, setStarHover]       = useState(0);
+
+  // For Libby books, fetch a Google Books cover if the stored URL isn't renderable
+  const [panelCoverUrl, setPanelCoverUrl] = useState<string | undefined>(book.coverUrl);
+  useEffect(() => {
+    setPanelCoverUrl(book.coverUrl);
+  }, [book.id, book.coverUrl]);
+
+  useEffect(() => {
+    const isGood = (u: string | undefined) =>
+      !!u && (u.includes("books.google") || u.includes("googleusercontent"));
+    const isLibby = book.formatSource?.startsWith("libby") || book.isLibbyHold;
+    if (!isLibby || isGood(panelCoverUrl)) return;
+
+    const controller = new AbortController();
+    const q = `${book.title} ${book.author ?? ""}`.trim();
+    fetch(`/api/search?q=${encodeURIComponent(q)}`, { signal: controller.signal })
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (!data || controller.signal.aborted) return;
+        const item = (data.items ?? []).find((i: { volumeInfo?: { imageLinks?: Record<string, string> } }) => i?.volumeInfo?.imageLinks) ?? data.items?.[0];
+        const links: Record<string, string> | undefined = item?.volumeInfo?.imageLinks;
+        const raw: string | undefined = links?.extraLarge ?? links?.large ?? links?.medium ?? links?.thumbnail ?? links?.smallThumbnail;
+        if (!raw) return;
+        const url = raw
+          .replace(/^http:\/\//, "https://")
+          .replace(/&edge=curl/g, "")
+          .replace(/&source=gbs_api/g, "");
+        setPanelCoverUrl(url);
+        onUpdate({ coverUrl: url });
+      })
+      .catch(() => {});
+
+    return () => controller.abort();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [book.id]);
 
   // Sync local state when the panel opens for a different book
   useEffect(() => {
@@ -79,6 +116,8 @@ export default function BookDetailPanel({ book, onUpdate, onDelete, onClose, sav
     setSeriesPos(book.seriesPosition?.toString() ?? "");
     setSeriesTotal(book.seriesTotal?.toString() ?? "");
     setPageCountDraft(book.pageCount?.toString() ?? "");
+    setSeriesStatusDraft(book.seriesStatus ?? "unknown");
+    setReleaseDateDraft(book.nextBookReleaseDate ?? "");
     setConfirmDelete(false);
     setStarHover(0);
   }, [book.id]);
@@ -152,10 +191,11 @@ export default function BookDetailPanel({ book, onUpdate, onDelete, onClose, sav
 
       {/* ── Cover header ── */}
       <div style={{ position: "relative", height: "180px", overflow: "hidden", flexShrink: 0 }}>
-        {book.coverUrl ? (
+        {panelCoverUrl ? (
           // eslint-disable-next-line @next/next/no-img-element
-          <img src={book.coverUrl} alt={book.title}
-            style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+          <img src={panelCoverUrl} alt={book.title}
+            style={{ width: "100%", height: "100%", objectFit: "cover" }}
+            onError={() => setPanelCoverUrl(undefined)} />
         ) : (
           <div style={{ width: "100%", height: "100%", background: book.coverGradient ?? "#1a0f2e" }} />
         )}
@@ -432,6 +472,45 @@ export default function BookDetailPanel({ book, onUpdate, onDelete, onClose, sav
             Affects spine width on the shelf
           </p>
         </div>
+
+        {DIVIDER}
+
+        {/* Series Status */}
+        <div>
+          <label style={LABEL}>Series Status</label>
+          <select
+            value={seriesStatusDraft}
+            onChange={e => setSeriesStatusDraft(e.target.value)}
+            onBlur={() => onUpdate({ seriesStatus: seriesStatusDraft as Book["seriesStatus"] })}
+            style={{ ...INPUT, cursor: "pointer" }}
+          >
+            <option value="unknown">Unknown</option>
+            <option value="ongoing">Ongoing</option>
+            <option value="complete">Complete</option>
+          </select>
+          <p style={{ marginTop: "5px", fontSize: "11px", color: "rgba(255,255,255,0.3)", fontFamily: "var(--font-crimson)", margin: "5px 0 0" }}>
+            Hides completed series from Next in Series
+          </p>
+        </div>
+
+        {seriesStatusDraft === "ongoing" && (
+          <>
+            {DIVIDER}
+            <div>
+              <label style={LABEL}>Next Book Release Date</label>
+              <input
+                type="date"
+                value={releaseDateDraft}
+                onChange={e => setReleaseDateDraft(e.target.value)}
+                onBlur={() => onUpdate({ nextBookReleaseDate: releaseDateDraft || undefined })}
+                style={INPUT}
+              />
+              <p style={{ marginTop: "5px", fontSize: "11px", color: "rgba(255,255,255,0.3)", fontFamily: "var(--font-crimson)", margin: "5px 0 0" }}>
+                Shows in Coming Soon when date is in the future
+              </p>
+            </div>
+          </>
+        )}
 
         {DIVIDER}
 

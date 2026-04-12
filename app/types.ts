@@ -22,6 +22,9 @@ export interface Book {
   returnDate?: string;         // for Libby loans
   pageCount?: number;
   shelfNumber?: number;
+  seriesStatus?: 'complete' | 'ongoing' | 'unknown';
+  nextBookReleaseDate?: string; // ISO date "YYYY-MM-DD"
+  isLibbyHold?: boolean;
 }
 
 /** Shape of a row in the Supabase `books` table. */
@@ -47,4 +50,6 @@ export interface DbBook {
   shelf_number: number | null;
   tbr_order: number | null;
   page_count: number | null;
+  series_status: string | null;
+  next_book_release_date: string | null;
 }

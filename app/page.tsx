@@ -33,6 +33,9 @@ function dbRowToBook(row: DbBook, index: number): Book {
     returnDate:   row.return_date   ?? undefined,
     pageCount:    row.page_count    ?? undefined,
     shelfNumber:  row.shelf_number  ?? 0,
+    seriesStatus: (row.series_status as Book['seriesStatus']) ?? undefined,
+    nextBookReleaseDate: row.next_book_release_date ?? undefined,
+    isLibbyHold: row.format_source?.includes("hold") ?? false,
     ...palette,
   };
 }
@@ -1220,6 +1223,7 @@ export default function HomePage() {
   async function handleUpdateBook(id: string | number, updates: Partial<Book>) {
     setBooks(prev => prev.map(b => b.id === id ? { ...b, ...updates } : b));
     const db: Record<string, unknown> = {};
+    if ("coverUrl"        in updates) db.cover_url        = updates.coverUrl       ?? null;
     if ("title"          in updates) db.title            = updates.title;
     if ("status"         in updates) db.status          = updates.status;
     if ("rating"         in updates) db.rating          = updates.rating ?? null;
@@ -1232,7 +1236,9 @@ export default function HomePage() {
     if ("seriesPosition" in updates) db.series_position = updates.seriesPosition ?? null;
     if ("seriesTotal"    in updates) db.series_total    = updates.seriesTotal   ?? null;
     if ("returnDate"     in updates) db.return_date     = updates.returnDate    ?? null;
-    if ("pageCount"      in updates) db.page_count      = updates.pageCount     ?? null;
+    if ("pageCount"            in updates) db.page_count             = updates.pageCount            ?? null;
+    if ("seriesStatus"         in updates) db.series_status          = updates.seriesStatus         ?? null;
+    if ("nextBookReleaseDate"  in updates) db.next_book_release_date = updates.nextBookReleaseDate  ?? null;
     const { error } = await supabase.from("books").update(db).eq("id", id);
     if (!error) {
       setSavedTs(Date.now());
@@ -1241,6 +1247,23 @@ export default function HomePage() {
         const recomputed = recomputeGrouping(updatedBooks, shelfWidthPx);
         setBooks(recomputed);
         persistGrouping(recomputed);
+      }
+      // Propagate series_status to all other books in the same series
+      if ("seriesStatus" in updates && updates.seriesStatus != null) {
+        const thisBook = books.find(b => b.id === id);
+        if (thisBook?.seriesName) {
+          const seriesName = thisBook.seriesName;
+          const seriesStatus = updates.seriesStatus;
+          // Update all siblings (excluding the book already saved above)
+          await supabase
+            .from("books")
+            .update({ series_status: seriesStatus })
+            .eq("series_name", seriesName)
+            .neq("id", String(id));
+          setBooks(prev => prev.map(b =>
+            b.seriesName === seriesName && b.id !== id ? { ...b, seriesStatus } : b
+          ));
+        }
       }
     }
   }
@@ -1336,6 +1359,8 @@ export default function HomePage() {
   const displayedBooks = useMemo(() => {
     if (isArrangeMode) return [...books];
     let result = [...books];
+    // Never show holds-in-queue on the shelf — only show when actively borrowed (reading)
+    result = result.filter(b => !(b.isLibbyHold && b.status === "tbr-not-owned"));
     if (filterStatus) result = result.filter(b => b.status === filterStatus);
     if (filterFormat) result = result.filter(b => (b.format ?? "physical") === filterFormat);
     switch (sortBy) {
@@ -1357,6 +1382,8 @@ export default function HomePage() {
   const displayShelves = isArrangeMode ? [...shelves, []] : shelves;
   const readCount = books.filter((b) => b.status === "read").length;
   const readingCount = books.filter((b) => b.status === "reading").length;
+  const holdCount = books.filter((b) => b.isLibbyHold && b.status === "tbr-not-owned").length;
+  const volumeCount = books.length - holdCount;
 
   const PILL = (label: string, active: boolean, onClick: () => void) => (
     <button key={label} onClick={onClick} style={{
@@ -1475,9 +1502,10 @@ export default function HomePage() {
 
           <div className="flex gap-8 mt-2">
             {[
-              { label: "Volumes", value: books.length },
+              { label: "Volumes", value: volumeCount },
               { label: "Read", value: readCount },
               { label: "In Progress", value: readingCount },
+              ...(holdCount > 0 ? [{ label: "On Hold", value: holdCount }] : []),
             ].map((stat) => (
               <div key={stat.label} className="flex flex-col items-center">
                 <span className="text-2xl font-semibold" style={{ fontFamily: "var(--font-cinzel)", color: "#d4a843" }}>{stat.value}</span>

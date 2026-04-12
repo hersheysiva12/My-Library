@@ -5,12 +5,16 @@ import { Search, Plus, Loader2 } from "lucide-react";
 import { Book } from "@/app/types";
 import { gradientPalette } from "@/lib/gradients";
 
-/** Strip the page-curl effect and upgrade to a higher-res flat cover. */
 function cleanCoverUrl(raw: string): string {
   return raw
     .replace(/^http:\/\//, "https://")
     .replace(/&edge=curl/g, "")
-    .replace(/zoom=1(&|$)/, "zoom=5$1");
+    .replace(/&source=gbs_api/g, "");
+}
+
+function bestGoogleCover(imageLinks: { extraLarge?: string; large?: string; medium?: string; thumbnail?: string; smallThumbnail?: string } | undefined): string | undefined {
+  if (!imageLinks) return undefined;
+  return imageLinks.extraLarge ?? imageLinks.large ?? imageLinks.medium ?? imageLinks.thumbnail ?? imageLinks.smallThumbnail;
 }
 
 interface GoogleBooksResult {
@@ -19,7 +23,7 @@ interface GoogleBooksResult {
     title: string;
     authors?: string[];
     pageCount?: number;
-    imageLinks?: { thumbnail?: string; smallThumbnail?: string };
+    imageLinks?: { extraLarge?: string; large?: string; medium?: string; thumbnail?: string; smallThumbnail?: string };
   };
 }
 
@@ -39,6 +43,7 @@ function nextPaletteEntry() {
 export default function SearchBar({ onAddBook, existingGoogleIds = [] }: SearchBarProps) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<GoogleBooksResult[]>([]);
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isOpen, setIsOpen] = useState(false);
   const [addedIds, setAddedIds] = useState<Set<string>>(new Set());
@@ -59,10 +64,19 @@ export default function SearchBar({ onAddBook, existingGoogleIds = [] }: SearchB
     if (!query.trim()) return;
     setIsLoading(true);
     setIsOpen(true);
+    setSearchError(null);
     try {
       const res = await fetch(`/api/search?q=${encodeURIComponent(query.trim())}`);
       const data = await res.json();
-      setResults(data.items ?? []);
+      if (!res.ok) {
+        setSearchError(data.message ?? "Search unavailable — try again shortly.");
+        setResults([]);
+      } else {
+        setResults(data.items ?? []);
+      }
+    } catch {
+      setSearchError("Could not reach the search service.");
+      setResults([]);
     } finally {
       setIsLoading(false);
     }
@@ -75,7 +89,7 @@ export default function SearchBar({ onAddBook, existingGoogleIds = [] }: SearchB
 
   function handleAdd(item: GoogleBooksResult) {
     const { volumeInfo } = item;
-    const rawThumb = volumeInfo.imageLinks?.thumbnail ?? volumeInfo.imageLinks?.smallThumbnail;
+    const rawThumb = bestGoogleCover(volumeInfo.imageLinks);
     const coverUrl = rawThumb ? cleanCoverUrl(rawThumb) : undefined;
 
     const palette = nextPaletteEntry();
@@ -138,6 +152,10 @@ export default function SearchBar({ onAddBook, existingGoogleIds = [] }: SearchB
               <Loader2 className="w-4 h-4 animate-spin" />
               <span style={{ fontFamily: "var(--font-crimson)", fontSize: "0.9rem" }}>Searching the archives…</span>
             </div>
+          ) : searchError ? (
+            <div className="py-6 text-center px-4" style={{ fontFamily: "var(--font-crimson)", color: "#f5e6c8", fontSize: "0.9rem" }}>
+              <span style={{ opacity: 0.7 }}>⚠ {searchError}</span>
+            </div>
           ) : results.length === 0 ? (
             <div className="py-6 text-center opacity-40" style={{ fontFamily: "var(--font-crimson)", color: "#f5e6c8", fontSize: "0.9rem" }}>
               No tomes found.
@@ -145,8 +163,7 @@ export default function SearchBar({ onAddBook, existingGoogleIds = [] }: SearchB
           ) : (
             results.map((item) => {
               const { volumeInfo } = item;
-              const rawThumbSmall = volumeInfo.imageLinks?.thumbnail ?? volumeInfo.imageLinks?.smallThumbnail;
-              const thumb = rawThumbSmall ? cleanCoverUrl(rawThumbSmall) : undefined;
+              const thumb = bestGoogleCover(volumeInfo.imageLinks) ? cleanCoverUrl(bestGoogleCover(volumeInfo.imageLinks)!) : undefined;
               const author = volumeInfo.authors?.[0] ?? "Unknown Author";
               const added = addedIds.has(item.id) || existingGoogleIds.includes(item.id);
 

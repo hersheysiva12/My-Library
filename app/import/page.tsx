@@ -133,12 +133,45 @@ function mapHoldToRow(h: ODHold) {
 /* ─────────────────────────────────────────────────────────
    Pure helpers
 ───────────────────────────────────────────────────────── */
-/** Strip the page-curl effect and upgrade to a higher-res flat cover. */
+/** Normalise a raw Google Books image URL:
+ *  - HTTPS
+ *  - Remove the page-curl 3-D effect (&edge=curl)
+ *  - Remove tracking noise (&source=gbs_api)
+ *  Resolution is handled by bestGoogleCover() picking extraLarge/large/medium
+ *  before thumbnail — so we never need to rewrite the zoom value here. */
 function cleanCoverUrl(raw: string): string {
   return raw
     .replace(/^http:\/\//, "https://")
     .replace(/&edge=curl/g, "")
-    .replace(/zoom=1(&|$)/, "zoom=5$1");
+    .replace(/&source=gbs_api/g, "");
+}
+
+/** Pick the best available Google Books cover URL from an imageLinks object,
+ *  preferring the highest-resolution source. */
+function bestGoogleCover(imageLinks: Record<string, string> | undefined): string | undefined {
+  if (!imageLinks) return undefined;
+  return (
+    imageLinks.extraLarge ??
+    imageLinks.large ??
+    imageLinks.medium ??
+    imageLinks.thumbnail ??
+    imageLinks.smallThumbnail
+  );
+}
+
+/** Try to get a real cover from Open Library using the book's ISBN.
+ *  Returns null if Open Library doesn't have it (redirects to placeholder). */
+async function openLibraryCover(identifiers: Array<{ type: string; identifier: string }> | undefined): Promise<string | null> {
+  if (!identifiers?.length) return null;
+  const isbn = (identifiers.find(i => i.type === "ISBN_13") ?? identifiers.find(i => i.type === "ISBN_10"))?.identifier;
+  if (!isbn) return null;
+  try {
+    const url = `https://covers.openlibrary.org/b/isbn/${isbn}-L.jpg`;
+    const res = await fetch(url);
+    // Open Library redirects to a placeholder when no cover exists
+    if (res.ok && !res.redirected) return url;
+  } catch { /* ignore */ }
+  return null;
 }
 
 /** Strip all parenthetical content from titles (e.g. Goodreads series info). */
@@ -430,6 +463,38 @@ export default function ImportPage() {
       if (he) console.error("[libby insert holds]", he.message, he.details, he.hint);
     }
 
+    // Replace OverDrive CDN cover URLs with permanent covers from Google Books / Open Library.
+    // If neither source has the cover, the OverDrive URL stays as a fallback.
+    const allNewRows = [...loanRows, ...holdRows];
+    for (const row of allNewRows) {
+      try {
+        const cleanTitle = row.title.replace(/[\u2018\u2019\u201c\u201d]/g, "'").replace(/[^\w\s'-]/g, " ").trim();
+        const cleanAuthor = (row.author ?? "").trim();
+        const authorLastName = cleanAuthor.split(" ").pop() ?? cleanAuthor;
+        const titleKeyword = cleanTitle.split(" ").filter(w => !["the","a","an"].includes(w.toLowerCase()))[0] ?? cleanTitle.split(" ")[0];
+
+        type GbItem = { volumeInfo?: { title?: string; imageLinks?: Record<string, string>; industryIdentifiers?: Array<{ type: string; identifier: string }> } };
+
+        let bestCoverUrl: string | null = null;
+        for (const q of [`intitle:"${cleanTitle}" inauthor:${authorLastName}`, `${cleanTitle} ${cleanAuthor}`, `intitle:"${cleanTitle}"`, cleanTitle]) {
+          const res = await fetch(`/api/search?q=${encodeURIComponent(q.trim())}`);
+          if (!res.ok) continue;
+          const items: GbItem[] = (await res.json()).items ?? [];
+          const item = items.find(i => i?.volumeInfo?.imageLinks && (i.volumeInfo.title ?? "").toLowerCase().includes(titleKeyword.toLowerCase()))
+            ?? items.find(i => i?.volumeInfo?.imageLinks) ?? items[0];
+          const raw = bestGoogleCover(item?.volumeInfo?.imageLinks);
+          if (raw) { bestCoverUrl = cleanCoverUrl(raw); break; }
+          if (!bestCoverUrl && item?.volumeInfo?.industryIdentifiers) {
+            bestCoverUrl = await openLibraryCover(item.volumeInfo.industryIdentifiers);
+            if (bestCoverUrl) break;
+          }
+        }
+        if (bestCoverUrl) {
+          await supabase.from("books").update({ cover_url: bestCoverUrl }).eq("google_books_id", row.google_books_id);
+        }
+      } catch { /* fail silently */ }
+    }
+
     setLibbyLoansSynced(loanRows.length);
     setLibbyHoldsSynced(holdRows.length);
     // Repack shelves so newly added books get proper shelf_number/sort_order
@@ -540,7 +605,7 @@ export default function ImportPage() {
       const data = await res.json();
       const item = data.items?.[0];
       if (!item) return { cover_url: null, google_books_id: null, page_count: null };
-      const raw: string | undefined = item.volumeInfo?.imageLinks?.thumbnail ?? item.volumeInfo?.imageLinks?.smallThumbnail;
+      const raw = bestGoogleCover(item.volumeInfo?.imageLinks);
       return {
         cover_url: raw ? cleanCoverUrl(raw) : null,
         google_books_id: item.id ?? null,
@@ -944,7 +1009,7 @@ export default function ImportPage() {
 
     const { data, error } = await supabase
       .from("books")
-      .select("id, title, author, google_books_id");
+      .select("id, title, author, google_books_id, format_source");
 
     if (error || !data) {
       setCoverRefreshError(error?.message ?? "Failed to fetch books");
@@ -954,40 +1019,121 @@ export default function ImportPage() {
 
     setCoverRefreshTotal(data.length);
 
-    // Fetch cover URLs — direct construction for known IDs, API search for the rest
-    const updates: { id: string; cover_url: string }[] = [];
+    // Small delay between API calls to stay well within Google Books rate limits
+    const delay = (ms: number) => new Promise<void>(res => setTimeout(res, ms));
 
-    for (const chunk of chunkArray(data, 10)) {
-      const results = await Promise.all(chunk.map(async (book) => {
-        if (book.google_books_id) {
-          // Construct directly — no API call needed
-          const cover_url = `https://books.google.com/books/content?id=${book.google_books_id}&printsec=frontcover&img=1&zoom=5`;
-          return { id: book.id, cover_url };
-        }
-        // Fall back to title+author search
-        try {
-          const q = `${book.title} ${book.author ?? ""}`;
-          const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
-          const json = await res.json();
-          const item = json.items?.[0];
-          const raw: string | undefined = item?.volumeInfo?.imageLinks?.thumbnail ?? item?.volumeInfo?.imageLinks?.smallThumbnail;
-          return raw ? { id: book.id, cover_url: cleanCoverUrl(raw) } : null;
-        } catch {
-          return null;
-        }
-      }));
-
-      for (const r of results) { if (r) updates.push(r); }
-      setCoverRefreshDone((prev) => prev + chunk.length);
+    // Helper: fetch cover for a known Google Books ID via the volumes endpoint.
+    // This is preferred over search for manually-added books because it returns the
+    // exact edition the user chose — search can match a different edition with no cover.
+    async function coverFromBookId(googleBooksId: string): Promise<string | null> {
+      try {
+        const res = await fetch(`/api/books/${encodeURIComponent(googleBooksId)}`);
+        if (!res.ok) return null;
+        const json = await res.json();
+        if (json.error === "rate_limited") throw new Error("rate_limited");
+        const raw = bestGoogleCover(json.imageLinks ?? undefined);
+        return raw ? cleanCoverUrl(raw) : null;
+      } catch (e) {
+        if ((e as Error).message === "rate_limited") throw e;
+        return null;
+      }
     }
 
-    // Apply cover updates in concurrent batches of 10
+    // Helper: search Google Books with multiple fallback query strategies,
+    // then fall back to Open Library if Google Books has no cover.
+    async function searchGoogleBooksCover(title: string, author: string | null): Promise<string | null> {
+      // Normalise: strip smart quotes / special punctuation that can break matching
+      const cleanTitle = title.replace(/[\u2018\u2019\u201c\u201d]/g, "'").replace(/[^\w\s'-]/g, " ").trim();
+      const cleanAuthor = (author ?? "").replace(/[\u2018\u2019\u201c\u201d]/g, "'").trim();
+      const authorLastName = cleanAuthor.split(" ").pop() ?? cleanAuthor;
+      const titleKeyword = cleanTitle.split(" ").filter(w => !["the","a","an"].includes(w.toLowerCase()))[0] ?? cleanTitle.split(" ")[0];
+
+      type GbItem = { volumeInfo?: { title?: string; imageLinks?: Record<string, string>; industryIdentifiers?: Array<{ type: string; identifier: string }> } };
+
+      const queries = [
+        `intitle:"${cleanTitle}" inauthor:${authorLastName}`,
+        `${cleanTitle} ${cleanAuthor}`,
+        `intitle:"${cleanTitle}"`,
+        cleanTitle,
+      ];
+
+      for (const q of queries) {
+        try {
+          const res = await fetch(`/api/search?q=${encodeURIComponent(q.trim())}`);
+          if (res.status === 429) throw new Error("rate_limited");
+          if (!res.ok) continue;
+          const json = await res.json();
+          if (json.error === "rate_limited") throw new Error("rate_limited");
+          const items: GbItem[] = json.items ?? [];
+
+          // Find the best-matching item that has an imageLinks entry
+          const item: GbItem | undefined =
+            items.find(i => i?.volumeInfo?.imageLinks && (i.volumeInfo.title ?? "").toLowerCase().includes(titleKeyword.toLowerCase()))
+            ?? items.find(i => i?.volumeInfo?.imageLinks);
+
+          if (!item) continue;
+
+          const raw = bestGoogleCover(item?.volumeInfo?.imageLinks);
+          if (raw) return cleanCoverUrl(raw);
+
+          // No Google Books cover — try Open Library with ISBN from this result
+          if (item?.volumeInfo?.industryIdentifiers) {
+            const olCover = await openLibraryCover(item.volumeInfo.industryIdentifiers);
+            if (olCover) return olCover;
+          }
+        } catch (e) {
+          if ((e as Error).message === "rate_limited") throw e;
+          /* try next query */
+        }
+      }
+      return null;
+    }
+
+    const updates: { id: string; cover_url: string }[] = [];
+    let rateLimited = false;
+
+    for (let i = 0; i < data.length; i++) {
+      if (rateLimited) break;
+
+      const book = data[i];
+      const isLibby = (book.format_source as string | null)?.startsWith("libby") ?? false;
+
+      try {
+        let cover_url: string | null = null;
+
+        if (!isLibby && book.google_books_id) {
+          // Non-Libby books: use the stored Google Books ID to get the exact edition's cover.
+          // Only fall back to search if the direct lookup has no imageLinks.
+          cover_url = await coverFromBookId(book.google_books_id as string);
+          if (!cover_url) {
+            await delay(300);
+            cover_url = await searchGoogleBooksCover(book.title as string, book.author as string | null);
+          }
+        } else {
+          // Libby books (or books with no google_books_id): always search by title+author.
+          cover_url = await searchGoogleBooksCover(book.title as string, book.author as string | null);
+        }
+
+        if (cover_url) updates.push({ id: book.id as string, cover_url });
+      } catch (e) {
+        if ((e as Error).message === "rate_limited") {
+          rateLimited = true;
+          setCoverRefreshError("Google Books rate limit reached — covers updated so far have been saved. Try again in a few minutes.");
+          break;
+        }
+      }
+
+      setCoverRefreshDone(i + 1);
+
+      // Pace requests: 350 ms between each book to stay under quota
+      if (i < data.length - 1) await delay(350);
+    }
+
+    // Apply cover updates sequentially to Supabase
     let updated = 0;
-    for (const chunk of chunkArray(updates, 10)) {
-      await Promise.all(chunk.map(async ({ id, cover_url }) => {
-        const { error: upErr } = await supabase.from("books").update({ cover_url }).eq("id", id);
-        if (!upErr) updated++;
-      }));
+    for (const { id, cover_url } of updates) {
+      const { error: upErr } = await supabase.from("books").update({ cover_url }).eq("id", id);
+      if (!upErr) updated++;
     }
 
     setCoverRefreshUpdated(updated);
@@ -1526,8 +1672,7 @@ export default function ImportPage() {
           </section>
         )}
 
-        {/* Divider */}
-        <hr style={{ border: "none", borderTop: "1px solid rgba(212,168,67,0.15)", margin: "52px 0" }} />
+        {activeTab === "import" && <><hr style={{ border: "none", borderTop: "1px solid rgba(212,168,67,0.15)", margin: "52px 0" }} />
 
         {/* ══════════════════════════════════════════
             SECTION 2 — MANUAL ISBN ENTRY
@@ -1686,6 +1831,132 @@ export default function ImportPage() {
             )}
           </div>
         </section>
+        </>}
+
+        {/* ══════════════════════════════════════════
+            SECTION 3 — SYNC LIBBY
+        ══════════════════════════════════════════ */}
+        {activeTab === "libby" && (
+          <section style={{ maxWidth: "480px" }}>
+            <h2 style={SECTION_HEADING}>Sync from Libby</h2>
+
+            {/* Already connected banner */}
+            {libbyToken && libbyCards.length > 0 && libbyPhase === "setup" && (
+              <div style={{
+                display: "flex", alignItems: "center", justifyContent: "space-between",
+                gap: "12px", padding: "10px 16px", marginBottom: "20px",
+                background: "rgba(20,120,80,0.12)", border: "1px solid rgba(109,204,154,0.25)",
+                borderRadius: "8px",
+              }}>
+                <span style={{ fontFamily: "var(--font-crimson)", fontSize: "14px", color: "#6dcc9a" }}>
+                  ✓ Connected to Libby{libbyCards.length > 1 ? ` · ${libbyCards.length} library cards` : libbyCards.length === 1 ? ` · ${libbyCards[0].cardName}` : ""}
+                </span>
+                <button
+                  onClick={() => { setLibbyToken(null); setLibbyCards([]); setSelectedCardKey(null); localStorage.removeItem("libbyAuth"); }}
+                  style={{ background: "none", border: "none", cursor: "pointer", fontFamily: "var(--font-cinzel)", fontSize: "8px", letterSpacing: "0.1em", textTransform: "uppercase", color: "rgba(240,224,192,0.3)" }}
+                >
+                  Disconnect
+                </button>
+              </div>
+            )}
+
+            {/* Setup phase */}
+            {libbyPhase === "setup" && (
+              <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                <p style={{ fontFamily: "var(--font-crimson)", fontSize: "14px", color: "rgba(240,224,192,0.55)", lineHeight: 1.6 }}>
+                  {libbyToken
+                    ? "Sync your latest loans and holds from Libby."
+                    : "Click Connect — we'll show you a code to enter in your Libby app."}
+                </p>
+                {libbyError && (
+                  <p style={{ fontFamily: "var(--font-crimson)", fontSize: "13px", color: "#f87171", fontStyle: "italic" }}>
+                    ⚠ {libbyError}
+                  </p>
+                )}
+                <div style={{ display: "flex", gap: "10px" }}>
+                  <button onClick={handleLibbyConnect} style={{ ...GOLD_BUTTON, alignSelf: "flex-start" }}>
+                    {libbyToken ? "Re-connect" : "Connect with Libby"}
+                  </button>
+                  {libbyToken && (
+                    <button onClick={handleReSync} style={{ ...GOLD_BUTTON, alignSelf: "flex-start" }}>
+                      Sync Now
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Code entry phase — user reads code from Libby and types it here */}
+            {libbyPhase === "code" && (
+              <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
+                <div style={{ fontFamily: "var(--font-crimson)", fontSize: "14px", color: "rgba(240,224,192,0.7)", lineHeight: 1.8 }}>
+                  <strong style={{ color: "rgba(240,224,192,0.9)", fontStyle: "normal" }}>In Libby:</strong> Copy To Another Device → choose <strong style={{ color: "#d4a843", fontStyle: "normal" }}>Sonos Speaker</strong> (or any listed device) → Libby will display an 8-digit code.
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                  <label style={{ fontFamily: "var(--font-cinzel)", fontSize: "9px", letterSpacing: "0.2em", textTransform: "uppercase", color: "rgba(212,168,67,0.6)" }}>
+                    Enter code from Libby
+                  </label>
+                  <input
+                    value={libbyInputCode}
+                    onChange={(e) => setLibbyInputCode(e.target.value.replace(/\D/g, "").slice(0, 8))}
+                    placeholder="12345678"
+                    maxLength={8}
+                    style={{
+                      fontFamily: "var(--font-cinzel)", fontSize: "28px", letterSpacing: "0.3em",
+                      background: "rgba(212,168,67,0.06)", border: "1px solid rgba(212,168,67,0.3)",
+                      borderRadius: "8px", padding: "16px 20px", color: "#f0e0c0",
+                      outline: "none", width: "100%", textAlign: "center",
+                    }}
+                  />
+                </div>
+                <div style={{ display: "flex", gap: "10px" }}>
+                  <button
+                    onClick={handleLibbyClone}
+                    disabled={libbyInputCode.length < 8}
+                    style={{ ...GOLD_BUTTON, opacity: libbyInputCode.length < 8 ? 0.4 : 1 }}
+                  >
+                    Sync Library
+                  </button>
+                  <button onClick={() => setLibbyPhase("setup")} style={{ ...GOLD_BUTTON, background: "none", borderColor: "rgba(212,168,67,0.2)", color: "rgba(212,168,67,0.4)" }}>
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Importing phase */}
+            {libbyPhase === "importing" && (
+              <div style={{ display: "flex", alignItems: "center", gap: "12px", padding: "24px 0", fontFamily: "var(--font-cinzel)", fontSize: "11px", letterSpacing: "0.15em", color: "rgba(240,224,192,0.5)" }}>
+                <Loader2 size={16} className="animate-spin" />
+                Importing your books…
+              </div>
+            )}
+
+            {/* Done phase */}
+            {libbyPhase === "done" && (
+              <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                <div style={{ padding: "20px 24px", background: "rgba(20,120,80,0.12)", border: "1px solid rgba(109,204,154,0.3)", borderRadius: "12px" }}>
+                  <p style={{ fontFamily: "var(--font-cinzel)", fontSize: "13px", letterSpacing: "0.08em", color: "#6dcc9a", marginBottom: "8px" }}>
+                    ✓ Sync complete
+                  </p>
+                  <p style={{ fontFamily: "var(--font-crimson)", fontSize: "15px", color: "rgba(240,224,192,0.75)" }}>
+                    {libbyLoansSynced > 0 || libbyHoldsSynced > 0
+                      ? `${libbyLoansSynced} active loan${libbyLoansSynced !== 1 ? "s" : ""} and ${libbyHoldsSynced} hold${libbyHoldsSynced !== 1 ? "s" : ""} synced from your Libby account${libbyCards.length > 1 ? ` (${libbyCards.length} library cards)` : libbyCards.length === 1 ? ` (${libbyCards[0].cardName})` : ""}.`
+                      : "No new books — your library is already up to date."}
+                  </p>
+                </div>
+                <div style={{ display: "flex", gap: "10px" }}>
+                  <button onClick={() => { setLibbyPhase("setup"); setLibbyError(null); }} style={GOLD_BUTTON}>
+                    Sync Again
+                  </button>
+                  <button onClick={() => router.push("/")} style={{ ...GOLD_BUTTON, background: "rgba(109,204,154,0.15)", borderColor: "rgba(109,204,154,0.4)", color: "#6dcc9a" }}>
+                    Return to Library
+                  </button>
+                </div>
+              </div>
+            )}
+          </section>
+        )}
 
         {/* Divider */}
         <hr style={{ border: "none", borderTop: "1px solid rgba(212,168,67,0.15)", margin: "52px 0" }} />
@@ -1813,130 +2084,6 @@ export default function ImportPage() {
           </div>}
         </section>
 
-        {/* ══════════════════════════════════════════
-            SECTION 3 — SYNC LIBBY
-        ══════════════════════════════════════════ */}
-        {activeTab === "libby" && (
-          <section style={{ maxWidth: "480px" }}>
-            <h2 style={SECTION_HEADING}>Sync from Libby</h2>
-
-            {/* Already connected banner */}
-            {libbyToken && libbyCards.length > 0 && libbyPhase === "setup" && (
-              <div style={{
-                display: "flex", alignItems: "center", justifyContent: "space-between",
-                gap: "12px", padding: "10px 16px", marginBottom: "20px",
-                background: "rgba(20,120,80,0.12)", border: "1px solid rgba(109,204,154,0.25)",
-                borderRadius: "8px",
-              }}>
-                <span style={{ fontFamily: "var(--font-crimson)", fontSize: "14px", color: "#6dcc9a" }}>
-                  ✓ Connected to Libby{libbyCards.length > 1 ? ` · ${libbyCards.length} library cards` : libbyCards.length === 1 ? ` · ${libbyCards[0].cardName}` : ""}
-                </span>
-                <button
-                  onClick={() => { setLibbyToken(null); setLibbyCards([]); setSelectedCardKey(null); localStorage.removeItem("libbyAuth"); }}
-                  style={{ background: "none", border: "none", cursor: "pointer", fontFamily: "var(--font-cinzel)", fontSize: "8px", letterSpacing: "0.1em", textTransform: "uppercase", color: "rgba(240,224,192,0.3)" }}
-                >
-                  Disconnect
-                </button>
-              </div>
-            )}
-
-            {/* Setup phase */}
-            {libbyPhase === "setup" && (
-              <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
-                <p style={{ fontFamily: "var(--font-crimson)", fontSize: "14px", color: "rgba(240,224,192,0.55)", lineHeight: 1.6 }}>
-                  {libbyToken
-                    ? "Sync your latest loans and holds from Libby."
-                    : "Click Connect — we'll show you a code to enter in your Libby app."}
-                </p>
-                {libbyError && (
-                  <p style={{ fontFamily: "var(--font-crimson)", fontSize: "13px", color: "#f87171", fontStyle: "italic" }}>
-                    ⚠ {libbyError}
-                  </p>
-                )}
-                <div style={{ display: "flex", gap: "10px" }}>
-                  <button onClick={handleLibbyConnect} style={{ ...GOLD_BUTTON, alignSelf: "flex-start" }}>
-                    {libbyToken ? "Re-connect" : "Connect with Libby"}
-                  </button>
-                  {libbyToken && (
-                    <button onClick={handleReSync} style={{ ...GOLD_BUTTON, alignSelf: "flex-start" }}>
-                      Sync Now
-                    </button>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {/* Code entry phase — user reads code from Libby and types it here */}
-            {libbyPhase === "code" && (
-              <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
-                <div style={{ fontFamily: "var(--font-crimson)", fontSize: "14px", color: "rgba(240,224,192,0.7)", lineHeight: 1.8 }}>
-                  <strong style={{ color: "rgba(240,224,192,0.9)", fontStyle: "normal" }}>In Libby:</strong> Copy To Another Device → choose <strong style={{ color: "#d4a843", fontStyle: "normal" }}>Sonos Speaker</strong> (or any listed device) → Libby will display an 8-digit code.
-                </div>
-                <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-                  <label style={{ fontFamily: "var(--font-cinzel)", fontSize: "9px", letterSpacing: "0.2em", textTransform: "uppercase", color: "rgba(212,168,67,0.6)" }}>
-                    Enter code from Libby
-                  </label>
-                  <input
-                    value={libbyInputCode}
-                    onChange={(e) => setLibbyInputCode(e.target.value.replace(/\D/g, "").slice(0, 8))}
-                    placeholder="12345678"
-                    maxLength={8}
-                    style={{
-                      fontFamily: "var(--font-cinzel)", fontSize: "28px", letterSpacing: "0.3em",
-                      background: "rgba(212,168,67,0.06)", border: "1px solid rgba(212,168,67,0.3)",
-                      borderRadius: "8px", padding: "16px 20px", color: "#f0e0c0",
-                      outline: "none", width: "100%", textAlign: "center",
-                    }}
-                  />
-                </div>
-                <div style={{ display: "flex", gap: "10px" }}>
-                  <button
-                    onClick={handleLibbyClone}
-                    disabled={libbyInputCode.length < 8}
-                    style={{ ...GOLD_BUTTON, opacity: libbyInputCode.length < 8 ? 0.4 : 1 }}
-                  >
-                    Sync Library
-                  </button>
-                  <button onClick={() => setLibbyPhase("setup")} style={{ ...GOLD_BUTTON, background: "none", borderColor: "rgba(212,168,67,0.2)", color: "rgba(212,168,67,0.4)" }}>
-                    Cancel
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {/* Importing phase */}
-            {libbyPhase === "importing" && (
-              <div style={{ display: "flex", alignItems: "center", gap: "12px", padding: "24px 0", fontFamily: "var(--font-cinzel)", fontSize: "11px", letterSpacing: "0.15em", color: "rgba(240,224,192,0.5)" }}>
-                <Loader2 size={16} className="animate-spin" />
-                Importing your books…
-              </div>
-            )}
-
-            {/* Done phase */}
-            {libbyPhase === "done" && (
-              <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
-                <div style={{ padding: "20px 24px", background: "rgba(20,120,80,0.12)", border: "1px solid rgba(109,204,154,0.3)", borderRadius: "12px" }}>
-                  <p style={{ fontFamily: "var(--font-cinzel)", fontSize: "13px", letterSpacing: "0.08em", color: "#6dcc9a", marginBottom: "8px" }}>
-                    ✓ Sync complete
-                  </p>
-                  <p style={{ fontFamily: "var(--font-crimson)", fontSize: "15px", color: "rgba(240,224,192,0.75)" }}>
-                    {libbyLoansSynced > 0 || libbyHoldsSynced > 0
-                      ? `${libbyLoansSynced} active loan${libbyLoansSynced !== 1 ? "s" : ""} and ${libbyHoldsSynced} hold${libbyHoldsSynced !== 1 ? "s" : ""} synced from your Libby account${libbyCards.length > 1 ? ` (${libbyCards.length} library cards)` : libbyCards.length === 1 ? ` (${libbyCards[0].cardName})` : ""}.`
-                      : "No new books — your library is already up to date."}
-                  </p>
-                </div>
-                <div style={{ display: "flex", gap: "10px" }}>
-                  <button onClick={() => { setLibbyPhase("setup"); setLibbyError(null); }} style={GOLD_BUTTON}>
-                    Sync Again
-                  </button>
-                  <button onClick={() => router.push("/")} style={{ ...GOLD_BUTTON, background: "rgba(109,204,154,0.15)", borderColor: "rgba(109,204,154,0.4)", color: "#6dcc9a" }}>
-                    Return to Library
-                  </button>
-                </div>
-              </div>
-            )}
-          </section>
-        )}
 
       </div>
     </div>
