@@ -1,58 +1,58 @@
 export const gradientPalette = [
   // Deep crimson
   {
-    coverGradient: "linear-gradient(160deg,#5c1a1a 0%,#3a0a0a 40%,#7a2020 100%)",
+    coverGradient: "linear-gradient(160deg,#7a3838 0%,#442828 40%,#983e3e 100%)",
     glowColor: "rgba(180,40,40,0.65)",
-    spineColor: "#5c1a1a",
+    spineColor: "#7a3838",
     accentColor: "#f4a4a4",
   },
   // Forest green
   {
-    coverGradient: "linear-gradient(160deg,#1a3d1a 0%,#0a200a 40%,#245c24 100%)",
+    coverGradient: "linear-gradient(160deg,#385b38 0%,#283e28 40%,#427a42 100%)",
     glowColor: "rgba(40,140,40,0.65)",
-    spineColor: "#1a3d1a",
+    spineColor: "#385b38",
     accentColor: "#86efac",
   },
   // Aged gold
   {
-    coverGradient: "linear-gradient(160deg,#4a3200 0%,#2e1e00 40%,#6a4800 100%)",
+    coverGradient: "linear-gradient(160deg,#68501e 0%,#4c3c1e 40%,#88661e 100%)",
     glowColor: "rgba(190,130,10,0.65)",
-    spineColor: "#4a3200",
+    spineColor: "#68501e",
     accentColor: "#fcd34d",
   },
   // Midnight sapphire
   {
-    coverGradient: "linear-gradient(160deg,#0d1a4a 0%,#060e2e 40%,#1a2a6a 100%)",
+    coverGradient: "linear-gradient(160deg,#2b3868 0%,#242c4c 40%,#384888 100%)",
     glowColor: "rgba(40,70,200,0.65)",
-    spineColor: "#0d1a4a",
+    spineColor: "#2b3868",
     accentColor: "#93c5fd",
   },
   // Oxblood
   {
-    coverGradient: "linear-gradient(160deg,#4a0a1a 0%,#2e0610 40%,#6a1428 100%)",
+    coverGradient: "linear-gradient(160deg,#682838 0%,#4c242e 40%,#883246 100%)",
     glowColor: "rgba(160,20,50,0.65)",
-    spineColor: "#4a0a1a",
+    spineColor: "#682838",
     accentColor: "#fda4af",
   },
   // Deep teal
   {
-    coverGradient: "linear-gradient(160deg,#063a3a 0%,#022424 40%,#0a5252 100%)",
+    coverGradient: "linear-gradient(160deg,#245858 0%,#204242 40%,#287070 100%)",
     glowColor: "rgba(20,140,140,0.65)",
-    spineColor: "#063a3a",
+    spineColor: "#245858",
     accentColor: "#5eead4",
   },
   // Burgundy
   {
-    coverGradient: "linear-gradient(160deg,#3a0a2e 0%,#240618 40%,#54103e 100%)",
+    coverGradient: "linear-gradient(160deg,#58284c 0%,#422436 40%,#722e5e 100%)",
     glowColor: "rgba(140,20,100,0.65)",
-    spineColor: "#3a0a2e",
+    spineColor: "#58284c",
     accentColor: "#f0abfc",
   },
   // Slate violet
   {
-    coverGradient: "linear-gradient(160deg,#1e1040 0%,#100828 40%,#2e1a5c 100%)",
+    coverGradient: "linear-gradient(160deg,#3c2e5e 0%,#2e2646 40%,#4c387a 100%)",
     glowColor: "rgba(80,50,200,0.65)",
-    spineColor: "#1e1040",
+    spineColor: "#3c2e5e",
     accentColor: "#c4b5fd",
   },
 ];

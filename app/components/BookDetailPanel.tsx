@@ -67,6 +67,9 @@ export default function BookDetailPanel({ book, onUpdate, onDelete, onClose, sav
   const [pageCountDraft, setPageCountDraft] = useState(book.pageCount?.toString() ?? "");
   const [seriesStatusDraft, setSeriesStatusDraft] = useState<string>(book.seriesStatus ?? "unknown");
   const [releaseDateDraft, setReleaseDateDraft] = useState(book.nextBookReleaseDate ?? "");
+  const [isReleaseTbaDraft, setIsReleaseTbaDraft] = useState(book.isReleaseTba ?? false);
+  const [checkingDate, setCheckingDate] = useState(false);
+  const [checkDateMsg, setCheckDateMsg] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [showSaved, setShowSaved]       = useState(false);
   const [starHover, setStarHover]       = useState(0);
@@ -118,6 +121,8 @@ export default function BookDetailPanel({ book, onUpdate, onDelete, onClose, sav
     setPageCountDraft(book.pageCount?.toString() ?? "");
     setSeriesStatusDraft(book.seriesStatus ?? "unknown");
     setReleaseDateDraft(book.nextBookReleaseDate ?? "");
+    setIsReleaseTbaDraft(book.isReleaseTba ?? false);
+    setCheckDateMsg(null);
     setConfirmDelete(false);
     setStarHover(0);
   }, [book.id]);
@@ -141,9 +146,51 @@ export default function BookDetailPanel({ book, onUpdate, onDelete, onClose, sav
 
   const today = () => new Date().toISOString().split("T")[0];
 
+  async function handleCheckDate() {
+    if (!seriesName) {
+      setCheckDateMsg("Enter a series name first");
+      return;
+    }
+    setCheckingDate(true);
+    setCheckDateMsg(null);
+    const nextPos = seriesPos ? Math.floor(Number(seriesPos)) + 1 : 1;
+    try {
+      const params = new URLSearchParams({
+        series: seriesName,
+        author: book.author ?? "",
+        pos: String(nextPos),
+      });
+      const res = await fetch(`/api/series-date?${params}`);
+      if (res.ok) {
+        const { date, reason, pastDate, source } = await res.json() as {
+          date: string | null;
+          reason?: string;
+          pastDate?: string;
+          source?: "web" | "ai";
+        };
+        if (date) {
+          setReleaseDateDraft(date);
+          const srcLabel = source === "web" ? "✓ Date found via web search" : "✓ Date found (AI estimate — verify)";
+          setCheckDateMsg(srcLabel);
+          onUpdate({ nextBookReleaseDate: date });
+        } else if (reason === "past" && pastDate) {
+          const fmt = new Date(pastDate + "T12:00:00Z").toLocaleDateString("en-US", { year: "numeric", month: "long" });
+          setCheckDateMsg(`Book ${nextPos} published ${fmt} — add it to your library`);
+        } else {
+          setCheckDateMsg("Date unknown — enter manually or check TBA");
+        }
+      } else {
+        setCheckDateMsg("Request failed — try again");
+      }
+    } catch {
+      setCheckDateMsg("Request failed — try again");
+    }
+    setCheckingDate(false);
+  }
+
   const INPUT: React.CSSProperties = {
-    background: "rgba(255,255,255,0.04)",
-    border: "1px solid rgba(212,168,67,0.2)",
+    background: "rgba(18,14,38,0.85)",
+    border: "1px solid rgba(212,168,67,0.25)",
     borderRadius: "4px",
     color: "rgba(255,240,200,0.9)",
     fontFamily: "var(--font-crimson)",
@@ -152,6 +199,7 @@ export default function BookDetailPanel({ book, onUpdate, onDelete, onClose, sav
     outline: "none",
     width: "100%",
     boxSizing: "border-box",
+    colorScheme: "dark",
   };
 
   const PILL: React.CSSProperties = {
@@ -179,7 +227,7 @@ export default function BookDetailPanel({ book, onUpdate, onDelete, onClose, sav
     <div style={{
       position: "fixed", top: 0, right: 0, bottom: 0,
       width: "clamp(340px, 420px, 92vw)",
-      background: "linear-gradient(170deg, #0d0a1e 0%, #110d22 60%, #0a0816 100%)",
+      background: "linear-gradient(170deg, #2c2850 0%, #322e58 60%, #282448 100%)",
       borderLeft: "1px solid rgba(212,168,67,0.25)",
       boxShadow: "-8px 0 40px rgba(212,168,67,0.08), -2px 0 8px rgba(0,0,0,0.8)",
       zIndex: 51,
@@ -199,7 +247,7 @@ export default function BookDetailPanel({ book, onUpdate, onDelete, onClose, sav
         ) : (
           <div style={{ width: "100%", height: "100%", background: book.coverGradient ?? "#1a0f2e" }} />
         )}
-        <div style={{ position: "absolute", inset: 0, background: "linear-gradient(to top, #0d0a1e 0%, rgba(13,10,30,0.65) 45%, transparent 100%)" }} />
+        <div style={{ position: "absolute", inset: 0, background: "linear-gradient(to top, #1e1a38 0%, rgba(30,26,56,0.65) 45%, transparent 100%)" }} />
         <button onClick={onClose} style={{
           position: "absolute", top: "12px", right: "12px",
           background: "rgba(0,0,0,0.55)", border: "1px solid rgba(212,168,67,0.3)",
@@ -432,16 +480,22 @@ export default function BookDetailPanel({ book, onUpdate, onDelete, onClose, sav
               onBlur={() => onUpdate({ seriesName: seriesName || undefined })}
               style={INPUT}
             />
-            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-              <span style={{ fontSize: "12px", color: "rgba(255,240,200,0.45)", whiteSpace: "nowrap" }}>Book</span>
-              <input
-                type="number" min={1} placeholder="1"
-                value={seriesPos}
-                onChange={e => setSeriesPos(e.target.value)}
-                onBlur={() => onUpdate({ seriesPosition: seriesPos ? Number(seriesPos) : undefined })}
-                style={{ ...INPUT, width: "64px", textAlign: "center" }}
-              />
-              <span style={{ fontSize: "12px", color: "rgba(255,240,200,0.45)" }}>of</span>
+            <div style={{ display: "flex", alignItems: "flex-start", gap: "8px" }}>
+              <span style={{ fontSize: "12px", color: "rgba(255,240,200,0.45)", whiteSpace: "nowrap", marginTop: "8px" }}>Book</span>
+              <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                <input
+                  type="number" min={0} step={0.5} placeholder="1"
+                  value={seriesPos}
+                  onChange={e => setSeriesPos(e.target.value)}
+                  onBlur={() => onUpdate({ seriesPosition: seriesPos ? Number(seriesPos) : undefined })}
+                  style={{ ...INPUT, width: "72px", textAlign: "center" }}
+                />
+                <p style={{ fontFamily: "var(--font-crimson)", fontSize: "11px", fontStyle: "italic",
+                  color: "rgba(240,224,192,0.35)", margin: 0, lineHeight: 1.4 }}>
+                  Use 0.5 for prologues, 4.5 for novellas between books 4 and 5
+                </p>
+              </div>
+              <span style={{ fontSize: "12px", color: "rgba(255,240,200,0.45)", marginTop: "8px" }}>of</span>
               <input
                 type="number" min={1} placeholder="?"
                 value={seriesTotal}
@@ -473,42 +527,91 @@ export default function BookDetailPanel({ book, onUpdate, onDelete, onClose, sav
           </p>
         </div>
 
-        {DIVIDER}
-
-        {/* Series Status */}
-        <div>
-          <label style={LABEL}>Series Status</label>
-          <select
-            value={seriesStatusDraft}
-            onChange={e => setSeriesStatusDraft(e.target.value)}
-            onBlur={() => onUpdate({ seriesStatus: seriesStatusDraft as Book["seriesStatus"] })}
-            style={{ ...INPUT, cursor: "pointer" }}
-          >
-            <option value="unknown">Unknown</option>
-            <option value="ongoing">Ongoing</option>
-            <option value="complete">Complete</option>
-          </select>
-          <p style={{ marginTop: "5px", fontSize: "11px", color: "rgba(255,255,255,0.3)", fontFamily: "var(--font-crimson)", margin: "5px 0 0" }}>
-            Hides completed series from Next in Series
-          </p>
-        </div>
-
-        {seriesStatusDraft === "ongoing" && (
+        {seriesOn && (
           <>
             {DIVIDER}
+
+            {/* Series Status */}
             <div>
-              <label style={LABEL}>Next Book Release Date</label>
-              <input
-                type="date"
-                value={releaseDateDraft}
-                onChange={e => setReleaseDateDraft(e.target.value)}
-                onBlur={() => onUpdate({ nextBookReleaseDate: releaseDateDraft || undefined })}
-                style={INPUT}
-              />
+              <label style={LABEL}>Series Status</label>
+              <select
+                value={seriesStatusDraft}
+                onChange={e => setSeriesStatusDraft(e.target.value)}
+                onBlur={() => onUpdate({ seriesStatus: seriesStatusDraft as Book["seriesStatus"] })}
+                style={{ ...INPUT, cursor: "pointer" }}
+              >
+                <option value="unknown">Unknown</option>
+                <option value="ongoing">Ongoing</option>
+                <option value="complete">Complete</option>
+              </select>
               <p style={{ marginTop: "5px", fontSize: "11px", color: "rgba(255,255,255,0.3)", fontFamily: "var(--font-crimson)", margin: "5px 0 0" }}>
-                Shows in Coming Soon when date is in the future
+                Hides completed series from Next in Series
               </p>
             </div>
+
+            {seriesStatusDraft === "ongoing" && (
+              <>
+                {DIVIDER}
+                <div>
+                  <label style={LABEL}>Next Book Release Date</label>
+                  <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                    <input
+                      type="date"
+                      value={releaseDateDraft}
+                      onChange={e => setReleaseDateDraft(e.target.value)}
+                      onBlur={() => onUpdate({ nextBookReleaseDate: releaseDateDraft || undefined })}
+                      style={{ ...INPUT, flex: 1 }}
+                    />
+                    <button
+                      onClick={handleCheckDate}
+                      disabled={checkingDate}
+                      style={{
+                        padding: "6px 10px", background: "transparent",
+                        border: "1px solid rgba(212,168,67,0.3)", borderRadius: "4px",
+                        color: "rgba(212,168,67,0.7)", fontFamily: "var(--font-cinzel)",
+                        fontSize: "9px", letterSpacing: "0.1em", cursor: "pointer",
+                        whiteSpace: "nowrap", flexShrink: 0,
+                      }}
+                    >
+                      {checkingDate ? "…" : "Check"}
+                    </button>
+                  </div>
+                  {checkDateMsg && (
+                    <p style={{ margin: "6px 0 0", fontSize: "11px", fontFamily: "var(--font-crimson)",
+                      color: checkDateMsg.startsWith("✓ Date found via web")
+                        ? "#86efac"
+                        : checkDateMsg.startsWith("✓ Date found")
+                          ? "rgba(212,168,67,0.9)"
+                          : checkDateMsg.startsWith("Request failed")
+                            ? "#f87171"
+                            : checkDateMsg.startsWith("Book ")
+                              ? "rgba(212,168,67,0.8)"
+                              : "rgba(255,240,200,0.45)",
+                      fontStyle: "italic" }}>
+                      {checkDateMsg}
+                    </p>
+                  )}
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px", marginTop: "8px" }}>
+                    <input
+                      type="checkbox"
+                      id="tba-cb"
+                      checked={isReleaseTbaDraft}
+                      onChange={e => {
+                        setIsReleaseTbaDraft(e.target.checked);
+                        onUpdate({ isReleaseTba: e.target.checked });
+                      }}
+                      style={{ accentColor: "#d4a843", width: "14px", height: "14px" }}
+                    />
+                    <label htmlFor="tba-cb" style={{ fontFamily: "var(--font-crimson)", fontSize: "13px", color: "rgba(255,240,200,0.55)", cursor: "pointer" }}>
+                      Release date TBA
+                    </label>
+                  </div>
+                  <p style={{ marginTop: "5px", fontSize: "11px", color: "rgba(255,255,255,0.3)", fontFamily: "var(--font-crimson)", margin: "5px 0 0" }}>
+                    Shows in Coming Soon when date is in the future or TBA is checked
+                  </p>
+                </div>
+              </>
+            )}
           </>
         )}
 

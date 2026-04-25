@@ -10,7 +10,17 @@ import {
 } from "@hello-pangea/dnd";
 import { Loader2, BookOpen, Search, Plus } from "lucide-react";
 import { supabase } from "@/lib/supabase";
-import type { DbBook } from "../types";
+import type { DbBook, Book } from "../types";
+import BookDetailPanel from "@/app/components/BookDetailPanel";
+
+/* ─────────────────────────────────────────────────────────
+   Helpers
+───────────────────────────────────────────────────────── */
+function formatSeriesPos(pos: number): string {
+  if (pos % 1 === 0) return `Book ${pos}`;
+  const label = Math.floor(pos) === 0 ? "Prequel" : "Novella";
+  return `Book ${pos} — ${label}`;
+}
 
 /* ─────────────────────────────────────────────────────────
    Types
@@ -25,10 +35,19 @@ interface TbrBook {
   seriesName: string | null;
   seriesPosition: number | null;
   seriesTotal: number | null;
+  seriesStatus: string | null;
+  nextBookReleaseDate: string | null;
+  isReleaseTba: boolean;
   rating: number | null;
   tbrOrder: number | null;
   status: string;
   isLibbyHold: boolean;
+  pageCount: number | null;
+  review: string | null;
+  startDate: string | null;
+  dateFinished: string | null;
+  googleBooksId: string | null;
+  returnDate: string | null;
 }
 
 interface AllBook {
@@ -41,6 +60,7 @@ interface AllBook {
   seriesTotal: number | null;
   seriesStatus: string | null;
   nextBookReleaseDate: string | null;
+  isReleaseTba?: boolean;
 }
 
 type SeriesGapKind = "ready" | "need-to-get" | "coming-soon";
@@ -149,15 +169,53 @@ function dbRowToTbrBook(row: DbBook): TbrBook {
     title: row.title,
     author: row.author ?? "Unknown",
     coverUrl: row.cover_url,
-    format: row.format,
+    format: (row.format_source?.includes("hold") && row.format == null) ? "ebook" : row.format,
     formatSource: row.format_source,
     seriesName: row.series_name,
     seriesPosition: row.series_position,
     seriesTotal: row.series_total,
+    seriesStatus: row.series_status ?? null,
+    nextBookReleaseDate: row.next_book_release_date ?? null,
+    isReleaseTba: row.is_release_tba ?? false,
     rating: row.rating,
     tbrOrder: row.tbr_order,
     status: row.status,
     isLibbyHold: row.format_source?.includes("hold") ?? false,
+    pageCount: row.page_count ?? null,
+    review: row.review ?? null,
+    startDate: row.start_date ?? null,
+    dateFinished: row.date_finished ?? null,
+    googleBooksId: row.google_books_id ?? null,
+    returnDate: row.return_date ?? null,
+  };
+}
+
+function tbrBookToBook(b: TbrBook): Book {
+  return {
+    id: b.id,
+    title: b.title,
+    author: b.author,
+    coverUrl: b.coverUrl ?? undefined,
+    googleBooksId: b.googleBooksId ?? undefined,
+    status: b.status as Book["status"],
+    rating: b.rating ?? undefined,
+    format: (b.format ?? "physical") as Book["format"],
+    formatSource: b.formatSource ?? undefined,
+    seriesName: b.seriesName ?? undefined,
+    seriesPosition: b.seriesPosition ?? undefined,
+    seriesTotal: b.seriesTotal ?? undefined,
+    seriesStatus: (b.seriesStatus ?? undefined) as Book["seriesStatus"],
+    nextBookReleaseDate: b.nextBookReleaseDate ?? undefined,
+    isReleaseTba: b.isReleaseTba,
+    pageCount: b.pageCount ?? undefined,
+    review: b.review ?? undefined,
+    startDate: b.startDate ?? undefined,
+    dateFinished: b.dateFinished ?? undefined,
+    returnDate: b.returnDate ?? undefined,
+    shelfNumber: 0,
+    glowColor: "rgba(212,168,67,0.3)",
+    spineColor: "#2a1f3d",
+    accentColor: "#d4a843",
   };
 }
 
@@ -307,7 +365,10 @@ export default function TbrPage() {
   const [addingGap, setAddingGap] = useState<string | null>(null);
   const [addError, setAddError] = useState<string | null>(null);
   const [hoveredRow, setHoveredRow] = useState<string | null>(null);
+  const [selectedBookId, setSelectedBookId] = useState<string | null>(null);
+  const [savedTs, setSavedTs] = useState(0);
   const dateBackfillRef = useRef(false);
+  const holdFormatBackfillRef = useRef(false);
 
   /* Libby availability */
   const [libbyCard, setLibbyCard] = useState<LibbyCard | null>(null);
@@ -322,7 +383,7 @@ export default function TbrPage() {
       .order("created_at", { ascending: true });
     if (data) {
       setAllBooks(
-        (data as Pick<DbBook, "id" | "title" | "author" | "status" | "series_name" | "series_position" | "series_total" | "series_status" | "next_book_release_date">[]).map((r) => ({
+        (data as Pick<DbBook, "id" | "title" | "author" | "status" | "series_name" | "series_position" | "series_total" | "series_status" | "next_book_release_date" | "is_release_tba">[]).map((r) => ({
           id: r.id,
           title: r.title,
           author: r.author,
@@ -332,6 +393,7 @@ export default function TbrPage() {
           seriesTotal: r.series_total,
           seriesStatus: r.series_status,
           nextBookReleaseDate: r.next_book_release_date,
+          isReleaseTba: r.is_release_tba ?? false,
         }))
       );
     }
@@ -373,7 +435,7 @@ export default function TbrPage() {
   /* ── Fetch availability once TBR books and Libby card are ready ── */
   useEffect(() => {
     if (!libbyCard || tbrBooks.length === 0) return;
-    const pending = tbrBooks.filter((b) => !availability[b.id]);
+    const pending = tbrBooks.filter((b) => !availability[b.id] && !b.isLibbyHold);
     if (pending.length === 0) return;
 
     // Mark all as loading
@@ -410,6 +472,25 @@ export default function TbrPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [libbyCard, tbrBooks.length]);
 
+  /* ── One-time backfill: persist "ebook" for Libby holds that have format=null in DB ── */
+  useEffect(() => {
+    if (holdFormatBackfillRef.current || tbrBooks.length === 0) return;
+    holdFormatBackfillRef.current = true;
+
+    const toFix = tbrBooks.filter(b => b.isLibbyHold && (b.format == null || b.format === ""));
+    if (toFix.length === 0) return;
+
+    // Update local state immediately
+    setTbrBooks(prev => prev.map(b =>
+      toFix.some(f => f.id === b.id) ? { ...b, format: "ebook" } : b
+    ));
+    // Persist to Supabase
+    Promise.all(
+      toFix.map(b => supabase.from("books").update({ format: "ebook" }).eq("id", b.id))
+    ).catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tbrBooks.length]);
+
   /* ── Drag and drop ── */
   async function handleDragEnd(result: DropResult) {
     if (!result.destination) return;
@@ -419,6 +500,66 @@ export default function TbrPage() {
     setTbrBooks(reordered);
     const updates = reordered.map((b, i) => ({ id: b.id, tbr_order: i }));
     await supabase.from("books").upsert(updates, { onConflict: "id" });
+  }
+
+  /* ── Detail panel update / delete ── */
+  async function handleUpdateTbrBook(id: string, updates: Partial<Book>) {
+    setTbrBooks(prev => prev.map(b => b.id === id ? {
+      ...b,
+      ...(updates.title        != null && { title: updates.title }),
+      ...(updates.author       != null && { author: updates.author }),
+      ...(updates.coverUrl     !== undefined && { coverUrl: updates.coverUrl ?? null }),
+      ...(updates.status       != null && { status: updates.status }),
+      ...(updates.rating       !== undefined && { rating: updates.rating ?? null }),
+      ...(updates.format       != null && { format: updates.format }),
+      ...(updates.formatSource !== undefined && { formatSource: updates.formatSource ?? null }),
+      ...(updates.seriesName   !== undefined && { seriesName: updates.seriesName ?? null }),
+      ...(updates.seriesPosition !== undefined && { seriesPosition: updates.seriesPosition ?? null }),
+      ...(updates.seriesTotal  !== undefined && { seriesTotal: updates.seriesTotal ?? null }),
+      ...(updates.seriesStatus !== undefined && { seriesStatus: updates.seriesStatus ?? null }),
+      ...(updates.nextBookReleaseDate !== undefined && { nextBookReleaseDate: updates.nextBookReleaseDate ?? null }),
+      ...(updates.isReleaseTba !== undefined && { isReleaseTba: updates.isReleaseTba ?? false }),
+      ...(updates.pageCount    !== undefined && { pageCount: updates.pageCount ?? null }),
+      ...(updates.review       !== undefined && { review: updates.review ?? null }),
+      ...(updates.startDate    !== undefined && { startDate: updates.startDate ?? null }),
+      ...(updates.dateFinished !== undefined && { dateFinished: updates.dateFinished ?? null }),
+      ...(updates.returnDate   !== undefined && { returnDate: updates.returnDate ?? null }),
+    } : b));
+
+    const db: Record<string, unknown> = {};
+    if ("title"               in updates) db.title                = updates.title;
+    if ("author"              in updates) db.author               = updates.author;
+    if ("coverUrl"            in updates) db.cover_url            = updates.coverUrl ?? null;
+    if ("status"              in updates) db.status               = updates.status;
+    if ("rating"              in updates) db.rating               = updates.rating ?? null;
+    if ("format"              in updates) db.format               = updates.format;
+    if ("formatSource"        in updates) db.format_source        = updates.formatSource ?? null;
+    if ("seriesName"          in updates) db.series_name          = updates.seriesName ?? null;
+    if ("seriesPosition"      in updates) db.series_position      = updates.seriesPosition ?? null;
+    if ("seriesTotal"         in updates) db.series_total         = updates.seriesTotal ?? null;
+    if ("seriesStatus"        in updates) db.series_status        = updates.seriesStatus ?? null;
+    if ("nextBookReleaseDate" in updates) db.next_book_release_date = updates.nextBookReleaseDate ?? null;
+    if ("isReleaseTba"        in updates) db.is_release_tba        = updates.isReleaseTba ?? null;
+    if ("pageCount"           in updates) db.page_count           = updates.pageCount ?? null;
+    if ("review"              in updates) db.review               = updates.review ?? null;
+    if ("startDate"           in updates) db.start_date           = updates.startDate ?? null;
+    if ("dateFinished"        in updates) db.date_finished        = updates.dateFinished ?? null;
+    if ("returnDate"          in updates) db.return_date          = updates.returnDate ?? null;
+
+    await supabase.from("books").update(db).eq("id", id);
+    setSavedTs(Date.now());
+
+    // If status changed away from TBR, remove from list
+    if (updates.status && updates.status !== "tbr-owned" && updates.status !== "tbr-not-owned") {
+      setTbrBooks(prev => prev.filter(b => b.id !== id));
+      setSelectedBookId(null);
+    }
+  }
+
+  async function handleDeleteTbrBook(id: string) {
+    await supabase.from("books").delete().eq("id", id);
+    setTbrBooks(prev => prev.filter(b => b.id !== id));
+    setSelectedBookId(null);
   }
 
   /* ── Series gaps ── */
@@ -440,19 +581,29 @@ export default function TbrPage() {
       // Skip if we've read all known books in the series
       if (book.seriesTotal != null && pos >= book.seriesTotal) return;
 
-      const nextPos = pos + 1;
-      const nextInLibrary = allBooks.find(
-        (b) => b.seriesName === seriesName && b.seriesPosition === nextPos
-      );
+      // Find the first unread book in the series after the highest-read position,
+      // sorted by position so 1.5 comes before 2 (novellas are not skipped).
+      const nextInLibrary = allBooks
+        .filter(b =>
+          b.seriesName === seriesName &&
+          b.seriesPosition != null &&
+          b.seriesPosition > pos &&
+          (b.status === "tbr-owned" || b.status === "tbr-not-owned")
+        )
+        .sort((a, b) => a.seriesPosition! - b.seriesPosition!)[0] ?? null;
 
-      if (nextInLibrary && (nextInLibrary.status === "tbr-owned" || nextInLibrary.status === "tbr-not-owned")) {
+      // Use the actual next book's position; fall back to next integer for "need to get" display
+      const nextPos = nextInLibrary?.seriesPosition ?? Math.floor(pos) + 1;
+
+      if (nextInLibrary) {
         // Sub-section 1: Next book already on shelf, ready to read
         gaps.push({ seriesName, lastBook: book, nextPosition: nextPos, seriesTotal: book.seriesTotal, kind: "ready", nextBookInLibrary: nextInLibrary });
       } else if (!nextInLibrary) {
-        // A future release date → coming-soon; otherwise need-to-get
+        // A future release date or TBA flag → coming-soon; otherwise need-to-get
         const releaseDate = book.nextBookReleaseDate;
         const isFuture = releaseDate ? new Date(releaseDate) > new Date() : false;
-        if (isFuture) {
+        const isTba = book.isReleaseTba;
+        if (isFuture || isTba) {
           gaps.push({ seriesName, lastBook: book, nextPosition: nextPos, seriesTotal: book.seriesTotal, kind: "coming-soon" });
         } else {
           gaps.push({ seriesName, lastBook: book, nextPosition: nextPos, seriesTotal: book.seriesTotal, kind: "need-to-get" });
@@ -479,58 +630,55 @@ export default function TbrPage() {
     highestFinished.forEach(({ book, pos }) => {
       if (book.seriesStatus === "complete") return;
       if (book.seriesTotal != null && pos >= book.seriesTotal) return;
-      // Skip only if stored date is plausible — re-fetch if date looks wrong (e.g. 1911)
+      // Skip only if stored date is in the future or very recent past (within 3 months)
+      // Re-fetch anything older — it was probably grabbed from the wrong series book
       if (book.nextBookReleaseDate) {
-        const storedYear = parseInt(book.nextBookReleaseDate.slice(0, 4));
-        const currentYear = new Date().getFullYear();
-        if (storedYear >= currentYear - 10 && storedYear <= currentYear + 10) return;
-        // stored date is implausible — fall through and re-fetch
+        const stored = new Date(book.nextBookReleaseDate);
+        const cutoff = new Date();
+        cutoff.setMonth(cutoff.getMonth() - 3);
+        if (stored > cutoff) return; // upcoming or recently-released — keep it
+        // stored date is stale/in the past — fall through and re-fetch
       }
-      const nextInLibrary = allBooks.some(b => b.seriesName === book.seriesName && b.seriesPosition === pos + 1);
-      if (!nextInLibrary) toFetch.push({ book, nextPos: pos + 1 });
+      const nextInLibrary = allBooks.some(b =>
+        b.seriesName === book.seriesName &&
+        b.seriesPosition != null &&
+        b.seriesPosition > pos
+      );
+      if (!nextInLibrary) toFetch.push({ book, nextPos: Math.floor(pos) + 1 });
     });
     if (toFetch.length === 0) return;
 
     dateBackfillRef.current = true;
 
     async function fetchReleaseDates() {
-      const currentYear = new Date().getFullYear();
       for (const { book, nextPos } of toFetch) {
-        // Track whether we're replacing a known-bad stored date
         const replacingBadDate = !!book.nextBookReleaseDate;
         let savedValidDate = false;
         try {
-          // Include author in the query to avoid false matches on unrelated books
-          const q = [book.seriesName, `book ${nextPos}`, book.author].filter(Boolean).join(" ");
-          const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+          const params = new URLSearchParams({
+            series: book.seriesName ?? "",
+            author: book.author ?? "",
+            pos: String(nextPos),
+          });
+          const res = await fetch(`/api/series-date?${params}`);
           if (res.ok) {
-            const data = await res.json();
-            const rawDate = data.items?.[0]?.volumeInfo?.publishedDate as string | undefined;
-            if (rawDate) {
-              // Normalise to YYYY-MM-DD
-              let normalized: string | null = null;
-              if (/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) normalized = rawDate;
-              else if (/^\d{4}-\d{2}$/.test(rawDate)) normalized = `${rawDate}-01`;
-              else if (/^\d{4}$/.test(rawDate)) normalized = `${rawDate}-07-01`;
-
-              if (normalized) {
-                const year = parseInt(normalized.slice(0, 4));
-                if (year >= currentYear - 10 && year <= currentYear + 10) {
-                  await supabase.from("books").update({ next_book_release_date: normalized }).eq("id", book.id);
-                  setAllBooks(prev => prev.map(b => b.id === book.id ? { ...b, nextBookReleaseDate: normalized } : b));
-                  savedValidDate = true;
-                }
-              }
+            const { date } = await res.json() as { date: string | null };
+            if (date) {
+              await supabase.from("books").update({ next_book_release_date: date }).eq("id", book.id);
+              setAllBooks(prev => prev.map(b => b.id === book.id ? { ...b, nextBookReleaseDate: date } : b));
+              savedValidDate = true;
             }
           }
         } catch { /* fail silently */ }
 
-        // If we were replacing a bad stored date but couldn't find a valid one, clear it
-        // so the card shows "TBD" instead of the wrong date
+        // Clear a stale stored date we couldn't replace with a valid future one
         if (replacingBadDate && !savedValidDate) {
           await supabase.from("books").update({ next_book_release_date: null }).eq("id", book.id);
           setAllBooks(prev => prev.map(b => b.id === book.id ? { ...b, nextBookReleaseDate: null } : b));
         }
+
+        // Small gap between Claude calls to stay within rate limits
+        await new Promise(r => setTimeout(r, 400));
       }
     }
     fetchReleaseDates();
@@ -580,7 +728,7 @@ export default function TbrPage() {
     <div
       style={{
         minHeight: "100vh",
-        background: "linear-gradient(170deg,#1a1530 0%,#2d1b4e 35%,#1e1340 70%,#170e2e 100%)",
+        background: "linear-gradient(170deg,#3a3060 0%,#4e3878 35%,#3c2e62 70%,#342854 100%)",
         color: "#f0e0c0",
         fontFamily: "var(--font-crimson)",
         padding: "40px 48px 80px",
@@ -662,91 +810,7 @@ export default function TbrPage() {
           </div>
         ) : (
           <>
-            {/* ── Libby Holds (above TBR queue) ── */}
-            {(() => {
-              const holdBooks  = tbrBooks.filter(b => b.isLibbyHold);
-              if (holdBooks.length === 0) return null;
-              return (
-                <section style={{ marginBottom: "48px" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: "12px",
-                    marginBottom: "20px", paddingBottom: "12px",
-                    borderBottom: "1px solid rgba(147,112,219,0.2)" }}>
-                    <span style={{ fontSize: "14px" }}>☽</span>
-                    <span style={{ fontFamily: "var(--font-cinzel)", fontSize: "11px",
-                      letterSpacing: "0.2em", textTransform: "uppercase",
-                      color: "rgba(147,112,219,0.8)" }}>
-                      Libby Holds
-                    </span>
-                    <span style={{ fontFamily: "var(--font-crimson)", fontSize: "12px",
-                      fontStyle: "italic", color: "rgba(147,112,219,0.4)" }}>
-                      ({holdBooks.length})
-                    </span>
-                  </div>
-
-                  <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-                    {holdBooks.map(book => (
-                      <div key={book.id} style={{
-                        display: "flex", alignItems: "center", gap: "14px",
-                        padding: "10px 16px",
-                        background: "rgba(147,112,219,0.04)",
-                        border: "1px solid rgba(147,112,219,0.18)",
-                        borderRadius: "8px",
-                      }}>
-                        {/* Cover */}
-                        <div style={{ width: "40px", height: "58px", flexShrink: 0,
-                          borderRadius: "2px", overflow: "hidden",
-                          background: "rgba(255,255,255,0.05)",
-                          border: "1px solid rgba(255,255,255,0.08)" }}>
-                          <LibbyCoverImg
-                            bookId={book.id}
-                            title={book.title}
-                            author={book.author}
-                            initialUrl={book.coverUrl}
-                          />
-                        </div>
-
-                        {/* Text */}
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ fontFamily: "var(--font-cinzel)", fontSize: "12px",
-                            color: "#f0e0c0", letterSpacing: "0.04em",
-                            whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
-                            marginBottom: "3px" }}>
-                            {book.title}
-                          </div>
-                          <div style={{ fontFamily: "var(--font-crimson)", fontSize: "13px",
-                            fontStyle: "italic", color: "rgba(240,224,192,0.55)",
-                            whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
-                            marginBottom: book.seriesName ? "4px" : 0 }}>
-                            {book.author}
-                          </div>
-                          {book.seriesName && (
-                            <div style={{ fontFamily: "var(--font-crimson)", fontSize: "11px",
-                              color: "rgba(212,168,67,0.5)" }}>
-                              {book.seriesName}{book.seriesPosition ? ` #${book.seriesPosition}` : ""}
-                            </div>
-                          )}
-                        </div>
-
-                        {/* Badge */}
-                        <div style={{ flexShrink: 0, padding: "3px 10px", borderRadius: "999px",
-                          background: "rgba(147,112,219,0.15)",
-                          border: "1px solid rgba(147,112,219,0.35)",
-                          fontFamily: "var(--font-cinzel)", fontSize: "9px",
-                          letterSpacing: "0.1em", textTransform: "uppercase" as const,
-                          color: "rgba(180,160,220,0.9)", whiteSpace: "nowrap" as const }}>
-                          On Hold
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </section>
-              );
-            })()}
-
             {/* ── Section 1: TBR List ── */}
-            {(() => {
-              const queueBooks = tbrBooks.filter(b => !b.isLibbyHold);
-              return (
             <section id="tbr-list" style={{ marginBottom: "64px" }}>
               <div
                 style={{
@@ -778,11 +842,11 @@ export default function TbrPage() {
                     color: "rgba(240,224,192,0.3)",
                   }}
                 >
-                  {queueBooks.length} {queueBooks.length === 1 ? "book" : "books"}
+                  {tbrBooks.length} {tbrBooks.length === 1 ? "book" : "books"}
                 </span>
               </div>
 
-              {queueBooks.length === 0 ? (
+              {tbrBooks.length === 0 ? (
                 <div
                   style={{
                     textAlign: "center",
@@ -810,7 +874,7 @@ export default function TbrPage() {
                         {...provided.droppableProps}
                         style={{ display: "flex", flexDirection: "column", gap: "6px" }}
                       >
-                        {queueBooks.map((book, i) => (
+                        {tbrBooks.map((book, i) => (
                           <Draggable
                             key={book.id}
                             draggableId={book.id}
@@ -822,6 +886,7 @@ export default function TbrPage() {
                                 {...provided.draggableProps}
                                 onMouseEnter={() => setHoveredRow(book.id)}
                                 onMouseLeave={() => setHoveredRow(null)}
+                                onClick={() => !snapshot.isDragging && setSelectedBookId(book.id)}
                                 style={{
                                   ...provided.draggableProps.style,
                                   display: "flex",
@@ -974,7 +1039,7 @@ export default function TbrPage() {
                                       }}
                                     >
                                       {book.seriesPosition != null
-                                        ? `Book ${book.seriesPosition}${book.seriesTotal ? ` of ${book.seriesTotal}` : ""} — ${book.seriesName}`
+                                        ? `${formatSeriesPos(book.seriesPosition)}${book.seriesTotal ? ` of ${book.seriesTotal}` : ""} — ${book.seriesName}`
                                         : book.seriesName}
                                     </div>
                                   )}
@@ -991,8 +1056,20 @@ export default function TbrPage() {
                                     flexShrink: 0,
                                   }}
                                 >
+                                  {book.isLibbyHold && (
+                                    <div style={{
+                                      padding: "3px 8px", borderRadius: "999px",
+                                      background: "rgba(147,112,219,0.15)",
+                                      border: "1px solid rgba(147,112,219,0.35)",
+                                      fontFamily: "var(--font-cinzel)", fontSize: "9px",
+                                      letterSpacing: "0.1em", textTransform: "uppercase" as const,
+                                      color: "rgba(180,160,220,0.9)", whiteSpace: "nowrap" as const,
+                                    }}>
+                                      ☽ On Hold
+                                    </div>
+                                  )}
                                   {book.format && <FormatBadge format={book.format} />}
-                                  {libbyCard && <LibbyAvailBadge result={availability[book.id]} />}
+                                  {libbyCard && !book.isLibbyHold && <LibbyAvailBadge result={availability[book.id]} />}
                                   {book.rating != null && book.rating > 0 && (
                                     <StarRating rating={book.rating} />
                                   )}
@@ -1008,8 +1085,6 @@ export default function TbrPage() {
                 </DragDropContext>
               )}
             </section>
-              );
-            })()}
 
             {/* ── Section 2: Next in Series ── */}
             {seriesGaps.length > 0 && (() => {
@@ -1057,20 +1132,20 @@ export default function TbrPage() {
                   <div style={{ fontFamily: "var(--font-crimson)", fontSize: "14px",
                     color: "#f0e0c0", marginBottom: "4px", lineHeight: 1.4 }}>
                     You finished <em>{gap.lastBook.title}</em>
-                    {gap.lastBook.seriesPosition != null && ` (Book ${gap.lastBook.seriesPosition})`}
+                    {gap.lastBook.seriesPosition != null && ` (${formatSeriesPos(gap.lastBook.seriesPosition)})`}
                   </div>
 
                   {/* Sub-text by kind */}
                   {gap.kind === "ready" && (
                     <div style={{ fontFamily: "var(--font-crimson)", fontSize: "13px",
                       fontStyle: "italic", color: "rgba(109,204,154,0.7)", marginBottom: "16px" }}>
-                      Book {gap.nextPosition}{gap.seriesTotal ? ` of ${gap.seriesTotal}` : ""} is waiting on your shelf
+                      {formatSeriesPos(gap.nextPosition)}{gap.seriesTotal ? ` of ${gap.seriesTotal}` : ""} is waiting on your shelf
                     </div>
                   )}
                   {gap.kind === "need-to-get" && (
                     <div style={{ fontFamily: "var(--font-crimson)", fontSize: "13px",
                       fontStyle: "italic", color: "rgba(240,224,192,0.5)", marginBottom: "16px" }}>
-                      Book {gap.nextPosition}{gap.seriesTotal ? ` of ${gap.seriesTotal}` : ""} is next — not yet in your library
+                      {formatSeriesPos(gap.nextPosition)}{gap.seriesTotal ? ` of ${gap.seriesTotal}` : ""} is next — not yet in your library
                       {gap.lastBook.nextBookReleaseDate && (
                         <span style={{ color: "rgba(212,168,67,0.7)" }}>
                           {" "}· Published {new Date(gap.lastBook.nextBookReleaseDate + "T00:00:00").toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })}
@@ -1081,10 +1156,12 @@ export default function TbrPage() {
                   {gap.kind === "coming-soon" && (
                     <div style={{ fontFamily: "var(--font-crimson)", fontSize: "13px",
                       fontStyle: "italic", color: "rgba(147,112,219,0.7)", marginBottom: "16px" }}>
-                      Book {gap.nextPosition}{gap.seriesTotal ? ` of ${gap.seriesTotal}` : ""} is coming
-                      {gap.lastBook.nextBookReleaseDate
-                        ? ` — ${new Date(gap.lastBook.nextBookReleaseDate + "T00:00:00").toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })}`
-                        : " — TBD"}
+                      {formatSeriesPos(gap.nextPosition)}{gap.seriesTotal ? ` of ${gap.seriesTotal}` : ""} is coming
+                      {gap.lastBook.isReleaseTba
+                        ? " — Release date TBA"
+                        : gap.lastBook.nextBookReleaseDate
+                          ? ` — ${new Date(gap.lastBook.nextBookReleaseDate + "T00:00:00").toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })}`
+                          : ""}
                     </div>
                   )}
 
@@ -1187,7 +1264,7 @@ export default function TbrPage() {
             })()}
 
             {/* Empty state when both sections are empty */}
-            {tbrBooks.filter(b => !b.isLibbyHold).length === 0 && seriesGaps.length === 0 && (
+            {tbrBooks.length === 0 && seriesGaps.length === 0 && (
               <div
                 style={{
                   textAlign: "center",
@@ -1228,6 +1305,21 @@ export default function TbrPage() {
       <style>{`
         @keyframes spin { to { transform: rotate(360deg); } }
       `}</style>
+
+      {/* Detail panel */}
+      {selectedBookId && (() => {
+        const book = tbrBooks.find(b => b.id === selectedBookId);
+        if (!book) return null;
+        return (
+          <BookDetailPanel
+            book={tbrBookToBook(book)}
+            onUpdate={(updates) => handleUpdateTbrBook(selectedBookId, updates)}
+            onDelete={() => handleDeleteTbrBook(selectedBookId)}
+            onClose={() => setSelectedBookId(null)}
+            savedTs={savedTs}
+          />
+        );
+      })()}
     </div>
   );
 }

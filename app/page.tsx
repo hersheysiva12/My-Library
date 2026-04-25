@@ -11,6 +11,16 @@ import { supabase } from "@/lib/supabase";
 import { paletteForIndex } from "@/lib/gradients";
 import { extractColorsFromCover } from "@/lib/extractColors";
 
+function extractSeriesFromTitle(title: string): { seriesName: string; position: number } | null {
+  const m = title.match(
+    /\(([^)]+?)(?:,\s*(?:book|vol\.?|volume|part|#)?\s*)([\d.]+)\s*\)/i
+  );
+  if (!m) return null;
+  const position = parseFloat(m[2]);
+  if (isNaN(position)) return null;
+  return { seriesName: m[1].trim(), position };
+}
+
 function dbRowToBook(row: DbBook, index: number): Book {
   const palette = paletteForIndex(index);
   return {
@@ -35,6 +45,7 @@ function dbRowToBook(row: DbBook, index: number): Book {
     shelfNumber:  row.shelf_number  ?? 0,
     seriesStatus: (row.series_status as Book['seriesStatus']) ?? undefined,
     nextBookReleaseDate: row.next_book_release_date ?? undefined,
+    isReleaseTba: row.is_release_tba ?? false,
     isLibbyHold: row.format_source?.includes("hold") ?? false,
     ...palette,
   };
@@ -808,7 +819,7 @@ function DepthMist() {
       {/* Upper mist — richer purple-indigo */}
       <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: "35%", background: "linear-gradient(to bottom, rgba(60,30,100,0.35) 0%, transparent 100%)" }} />
       {/* Side vignettes — slightly softer */}
-      <div style={{ position: "absolute", inset: 0, background: "radial-gradient(ellipse at 50% 50%, transparent 35%, rgba(8,4,20,0.55) 100%)" }} />
+      <div style={{ position: "absolute", inset: 0, background: "radial-gradient(ellipse at 50% 50%, transparent 35%, rgba(8,4,20,0.25) 100%)" }} />
       {/* Bottom warmth */}
       <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: "25%", background: "linear-gradient(to top, rgba(120,70,10,0.18) 0%, transparent 100%)" }} />
     </div>
@@ -1114,51 +1125,100 @@ export default function HomePage() {
     });
   }, [books]);
 
-  // Backfill page counts from Google Books for books that don't have one yet
+  // Backfill page counts and series info from Google Books for books that don't have them yet
   const backfillDoneRef = useRef(false);
   useEffect(() => {
     if (backfillDoneRef.current || books.length === 0) return;
     backfillDoneRef.current = true;
 
-    const needsCount = books.filter(b => b.pageCount == null);
-    if (needsCount.length === 0) return;
+    // Books needing a network call (missing page count or series position)
+    const needsData = books.filter(b =>
+      (b.pageCount == null || b.seriesPosition == null) && !!b.googleBooksId
+    );
+    // Books where title parsing alone can fill series (no network needed)
+    const needsTitleParse = books.filter(b =>
+      b.seriesName == null && b.seriesPosition == null
+    );
+    if (needsData.length === 0 && needsTitleParse.length === 0) return;
 
     async function backfill() {
-      const BATCH = 5;
-      const upserts: { id: string; page_count: number }[] = [];
+      // Pass 1 — Title regex (zero network calls)
+      const titleParseUpserts: { id: string; series_name: string; series_position: number }[] = [];
+      for (const book of needsTitleParse) {
+        if (book.seriesName != null) continue;
+        const parsed = extractSeriesFromTitle(book.title);
+        if (parsed) {
+          titleParseUpserts.push({ id: String(book.id), series_name: parsed.seriesName, series_position: parsed.position });
+          setBooks(prev => prev.map(b => b.id === book.id ? { ...b, seriesName: parsed.seriesName, seriesPosition: parsed.position } : b));
+        }
+      }
+      if (titleParseUpserts.length > 0)
+        await supabase.from("books").upsert(titleParseUpserts, { onConflict: "id" });
 
-      for (let i = 0; i < needsCount.length; i += BATCH) {
-        const chunk = needsCount.slice(i, i + BATCH);
-        await Promise.all(chunk.map(async (book) => {
-          let pageCount: number | null = null;
+      // Pass 2 — Network (sequential, 350ms between books)
+      // Libby books have OverDrive IDs stored as googleBooksId — these don't work with
+      // the Google Books volumes API, so route them to the search fallback instead.
+      const isLibbyBook = (b: Book) => b.formatSource?.startsWith("libby") ?? false;
+      let rateLimited = false;
+      const upserts: Record<string, unknown>[] = [];
 
-          // Try direct Google Books volume lookup first
-          if (book.googleBooksId) {
-            try {
-              const res = await fetch(`/api/books/${encodeURIComponent(book.googleBooksId)}`);
-              if (res.ok) pageCount = (await res.json()).pageCount ?? null;
-            } catch { /* ignore */ }
+      for (const book of needsData) {
+        if (rateLimited) break;
+        if (isLibbyBook(book)) { await new Promise(r => setTimeout(r, 350)); continue; }
+        try {
+          const res = await fetch(`/api/books/${encodeURIComponent(book.googleBooksId!)}`);
+          if (res.status === 429) { rateLimited = true; break; }
+          if (!res.ok) { await new Promise(r => setTimeout(r, 350)); continue; }
+
+          const fetched = await res.json();
+          const row: Record<string, unknown> = { id: String(book.id) };
+          const stateUpdate: Partial<Book> = {};
+
+          if (book.pageCount == null && fetched.pageCount) {
+            row.page_count = fetched.pageCount;
+            stateUpdate.pageCount = fetched.pageCount;
           }
 
-          // Fall back to title+author search (handles OverDrive IDs and missing IDs)
-          if (!pageCount) {
-            try {
-              const q = encodeURIComponent(`${book.title} ${book.author ?? ""}`.trim());
-              const res = await fetch(`/api/search?q=${q}`);
-              if (res.ok) {
-                const d = await res.json();
-                pageCount = d.items?.[0]?.volumeInfo?.pageCount ?? null;
-              }
-            } catch { /* ignore */ }
+          if (book.seriesPosition == null && fetched.seriesPosition != null) {
+            row.series_position = fetched.seriesPosition;
+            stateUpdate.seriesPosition = fetched.seriesPosition;
           }
 
-          if (pageCount) {
-            upserts.push({ id: String(book.id), page_count: pageCount });
-            setBooks(prev => prev.map(b => b.id === book.id ? { ...b, pageCount: pageCount! } : b));
+          // Parse series name from title if we now have a position but no name
+          if (book.seriesName == null && (stateUpdate.seriesPosition != null || book.seriesPosition != null)) {
+            const parsed = extractSeriesFromTitle(book.title);
+            if (parsed) {
+              row.series_name = parsed.seriesName;
+              stateUpdate.seriesName = parsed.seriesName;
+            }
           }
-        }));
 
-        if (i + BATCH < needsCount.length) await new Promise(r => setTimeout(r, 250));
+          if (Object.keys(row).length > 1) {
+            upserts.push(row);
+            setBooks(prev => prev.map(b => b.id === book.id ? { ...b, ...stateUpdate } : b));
+          }
+        } catch { /* ignore individual failures */ }
+
+        await new Promise(r => setTimeout(r, 350));
+      }
+
+      // Search fallback: books with no googleBooksId OR Libby books (OverDrive IDs ≠ Google Books IDs)
+      const noIdBooks = books.filter(b => b.pageCount == null && (!b.googleBooksId || isLibbyBook(b)));
+      for (const book of noIdBooks) {
+        if (rateLimited) break;
+        try {
+          const q = encodeURIComponent(`${book.title} ${book.author ?? ""}`.trim());
+          const res = await fetch(`/api/search?q=${q}`);
+          if (res.ok) {
+            const d = await res.json();
+            const pageCount: number | null = d.items?.[0]?.volumeInfo?.pageCount ?? null;
+            if (pageCount) {
+              upserts.push({ id: String(book.id), page_count: pageCount });
+              setBooks(prev => prev.map(b => b.id === book.id ? { ...b, pageCount } : b));
+            }
+          }
+        } catch { /* ignore */ }
+        await new Promise(r => setTimeout(r, 350));
       }
 
       if (upserts.length > 0) {
@@ -1205,6 +1265,8 @@ export default function HomePage() {
       .insert({ title: book.title, author: book.author, cover_url: book.coverUrl ?? null,
                 google_books_id: googleId, status: "tbr-owned",
                 page_count: book.pageCount ?? null,
+                series_name: book.seriesName ?? null,
+                series_position: book.seriesPosition ?? null,
                 shelf_number: targetShelf, sort_order: shelfPosition })
       .select().single();
     if (error) {
@@ -1218,6 +1280,46 @@ export default function HomePage() {
       if (matchesSeries) persistGrouping(updated);
       return updated;
     });
+
+    // Fetch page count and series position from volumes API if not already populated
+    const needsPageCount = !book.pageCount;
+    const needsSeriesPos = !book.seriesPosition;
+    if ((needsPageCount || needsSeriesPos) && googleId) {
+      try {
+        const res = await fetch(`/api/books/${encodeURIComponent(googleId)}`);
+        if (res.ok) {
+          const fetched = await res.json();
+          const dbUpdates: Record<string, unknown> = {};
+          const stateUpdates: Partial<Book> = {};
+
+          if (needsPageCount && fetched.pageCount) {
+            dbUpdates.page_count = fetched.pageCount;
+            stateUpdates.pageCount = fetched.pageCount;
+          }
+          if (needsSeriesPos && fetched.seriesPosition != null) {
+            dbUpdates.series_position = fetched.seriesPosition;
+            stateUpdates.seriesPosition = fetched.seriesPosition;
+            if (!book.seriesName) {
+              const parsed = extractSeriesFromTitle(book.title);
+              if (parsed) {
+                dbUpdates.series_name = parsed.seriesName;
+                stateUpdates.seriesName = parsed.seriesName;
+              }
+            }
+          }
+
+          if (Object.keys(dbUpdates).length > 0) {
+            await supabase.from("books").update(dbUpdates).eq("id", realId);
+            setBooks(prev => {
+              const updated = prev.map(b => b.id === realId ? { ...b, ...stateUpdates } : b);
+              const recomputed = recomputeGrouping(updated, shelfWidthPx);
+              persistGrouping(recomputed);
+              return recomputed;
+            });
+          }
+        }
+      } catch { /* non-critical, backfill will catch it next load */ }
+    }
   }
 
   async function handleUpdateBook(id: string | number, updates: Partial<Book>) {
@@ -1239,6 +1341,7 @@ export default function HomePage() {
     if ("pageCount"            in updates) db.page_count             = updates.pageCount            ?? null;
     if ("seriesStatus"         in updates) db.series_status          = updates.seriesStatus         ?? null;
     if ("nextBookReleaseDate"  in updates) db.next_book_release_date = updates.nextBookReleaseDate  ?? null;
+    if ("isReleaseTba"         in updates) db.is_release_tba         = updates.isReleaseTba         ?? null;
     const { error } = await supabase.from("books").update(db).eq("id", id);
     if (!error) {
       setSavedTs(Date.now());
@@ -1264,6 +1367,14 @@ export default function HomePage() {
             b.seriesName === seriesName && b.id !== id ? { ...b, seriesStatus } : b
           ));
         }
+      }
+      // Job 1 — series hold reminder (fire-and-forget; never throws into UI)
+      if (updates.status === "read") {
+        fetch("/api/notifications/series-reminder", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ bookId: String(id) }),
+        }).catch(() => {});
       }
     }
   }
@@ -1423,7 +1534,7 @@ export default function HomePage() {
   return (
     <div
       className="min-h-screen overflow-x-hidden"
-      style={{ background: "linear-gradient(170deg, #1a1530 0%, #2d1b4e 35%, #1e1340 70%, #170e2e 100%)" }}
+      style={{ background: "linear-gradient(170deg, #3a3060 0%, #4e3878 35%, #3c2e62 70%, #342854 100%)" }}
       onClick={handlePageClick}
     >
       <div className="page-vignette" />

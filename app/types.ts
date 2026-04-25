@@ -25,6 +25,7 @@ export interface Book {
   seriesStatus?: 'complete' | 'ongoing' | 'unknown';
   nextBookReleaseDate?: string; // ISO date "YYYY-MM-DD"
   isLibbyHold?: boolean;
+  isReleaseTba?: boolean;
 }
 
 /** Shape of a row in the Supabase `books` table. */
@@ -52,4 +53,5 @@ export interface DbBook {
   page_count: number | null;
   series_status: string | null;
   next_book_release_date: string | null;
+  is_release_tba: boolean | null;
 }

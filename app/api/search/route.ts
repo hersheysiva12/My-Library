@@ -4,7 +4,7 @@ export async function GET(request: NextRequest) {
   const q = request.nextUrl.searchParams.get("q");
   if (!q?.trim()) return NextResponse.json({ items: [] });
 
-  const url = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&key=${process.env.GOOGLE_BOOKS_API_KEY}&maxResults=8&printType=books`;
+  const url = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&key=${process.env.GOOGLE_BOOKS_API_KEY}&maxResults=12&printType=books`;
 
   try {
     const res = await fetch(url, { cache: "no-store" });

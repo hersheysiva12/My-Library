@@ -82,8 +82,7 @@ interface ODHold {
 function odFormat(formats?: { id: string }[]): { format: string | null; format_source: string } {
   const ids = (formats ?? []).map((f) => f.id);
   if (ids.some((id) => id.startsWith("audiobook"))) return { format: "audiobook", format_source: "libby-loan" };
-  // "ebook" may not pass the DB check constraint — store null, identify via format_source
-  return { format: null, format_source: "libby-loan" };
+  return { format: "ebook", format_source: "libby-loan" };
 }
 
 function odCover(covers?: ODLoan["covers"]): string | null {
@@ -177,6 +176,16 @@ async function openLibraryCover(identifiers: Array<{ type: string; identifier: s
 /** Strip all parenthetical content from titles (e.g. Goodreads series info). */
 function stripSeriesFromTitle(title: string): string {
   return title.replace(/\s*\([^)]*\)/g, "").trim();
+}
+
+function extractSeriesFromTitle(title: string): { seriesName: string; position: number } | null {
+  const m = title.match(
+    /\(([^)]+?)(?:,\s*(?:book|vol\.?|volume|part|#)?\s*)([\d.]+)\s*\)/i
+  );
+  if (!m) return null;
+  const position = parseFloat(m[2]);
+  if (isNaN(position)) return null;
+  return { seriesName: m[1].trim(), position };
 }
 
 function stripIsbn(raw: string): string | null {
@@ -349,6 +358,8 @@ export default function ImportPage() {
   const [libbyPhase, setLibbyPhase] = useState<"setup" | "code" | "importing" | "done">("setup");
   const [libbyLoansSynced, setLibbyLoansSynced] = useState(0);
   const [libbyHoldsSynced, setLibbyHoldsSynced] = useState(0);
+  const [libbyUpdated, setLibbyUpdated] = useState(0);
+  const [libbySkipped, setLibbySkipped] = useState(0);
   const [libbyError, setLibbyError] = useState<string | null>(null);
 
   /* CSV */
@@ -404,6 +415,13 @@ export default function ImportPage() {
   const [coverRefreshUpdated, setCoverRefreshUpdated] = useState<number | null>(null);
   const [coverRefreshError, setCoverRefreshError] = useState<string | null>(null);
 
+  /* Backfill page counts */
+  const [backfillPCRunning, setBackfillPCRunning] = useState(false);
+  const [backfillPCTotal, setBackfillPCTotal] = useState(0);
+  const [backfillPCDone, setBackfillPCDone] = useState(0);
+  const [backfillPCResult, setBackfillPCResult] = useState<number | null>(null);
+  const [backfillPCError, setBackfillPCError] = useState<string | null>(null);
+
   /* ISBN */
   const [isbnInput, setIsbnInput] = useState("");
   const [isbnLoading, setIsbnLoading] = useState(false);
@@ -445,14 +463,53 @@ export default function ImportPage() {
   }
 
   async function importLibbyData(loans: ODLoan[], holds: ODHold[]) {
+    // Fetch broader existing set for title+author dedup in addition to google_books_id dedup
     const { data: existing } = await supabase
       .from("books")
-      .select("google_books_id")
-      .not("google_books_id", "is", null);
-    const existingIds = new Set((existing ?? []).map((r: { google_books_id: string }) => r.google_books_id));
+      .select("id, google_books_id, title, author, status");
 
-    const loanRows = loans.filter((l) => !existingIds.has(l.id)).map(mapLoanToRow);
-    const holdRows = holds.filter((h) => !existingIds.has(h.id)).map(mapHoldToRow);
+    const byId = new Map(
+      (existing ?? []).filter(r => r.google_books_id)
+        .map(r => [r.google_books_id as string, r as { id: string; status: string }])
+    );
+    const byKey = new Map(
+      (existing ?? []).map(r => [
+        `${(r.title ?? "").toLowerCase().trim()}::${(r.author ?? "").toLowerCase().trim()}`,
+        r as { id: string; status: string }
+      ])
+    );
+
+    const loanRows: ReturnType<typeof mapLoanToRow>[] = [];
+    const holdRows: ReturnType<typeof mapHoldToRow>[] = [];
+    const loanUpdates: Array<{ id: string; u: Record<string, unknown> }> = [];
+    let skipped = 0;
+
+    for (const loan of loans) {
+      const mapped = mapLoanToRow(loan);
+      const key = `${mapped.title.toLowerCase().trim()}::${(mapped.author ?? "").toLowerCase().trim()}`;
+      const match = byId.get(loan.id) ?? byKey.get(key);
+      if (!match) {
+        loanRows.push(mapped);
+      } else if (match.status === "tbr-owned" || match.status === "tbr-not-owned") {
+        // Upgrade existing TBR book to reflect active Libby loan
+        loanUpdates.push({ id: match.id, u: {
+          status: "reading",
+          format: mapped.format,
+          format_source: mapped.format_source,
+          return_date: mapped.return_date ?? null,
+          google_books_id: loan.id,
+        }});
+      } else {
+        skipped++;
+      }
+    }
+    for (const hold of holds) {
+      const mapped = mapHoldToRow(hold);
+      const key = `${mapped.title.toLowerCase().trim()}::${(mapped.author ?? "").toLowerCase().trim()}`;
+      const match = byId.get(hold.id) ?? byKey.get(key);
+      if (!match) holdRows.push(mapped);
+      else skipped++;
+    }
 
     if (loanRows.length > 0) {
       const { error: le } = await supabase.from("books").insert(loanRows);
@@ -461,6 +518,9 @@ export default function ImportPage() {
     if (holdRows.length > 0) {
       const { error: he } = await supabase.from("books").insert(holdRows);
       if (he) console.error("[libby insert holds]", he.message, he.details, he.hint);
+    }
+    for (const { id, u } of loanUpdates) {
+      await supabase.from("books").update(u).eq("id", id);
     }
 
     // Replace OverDrive CDN cover URLs with permanent covers from Google Books / Open Library.
@@ -473,9 +533,10 @@ export default function ImportPage() {
         const authorLastName = cleanAuthor.split(" ").pop() ?? cleanAuthor;
         const titleKeyword = cleanTitle.split(" ").filter(w => !["the","a","an"].includes(w.toLowerCase()))[0] ?? cleanTitle.split(" ")[0];
 
-        type GbItem = { volumeInfo?: { title?: string; imageLinks?: Record<string, string>; industryIdentifiers?: Array<{ type: string; identifier: string }> } };
+        type GbItem = { volumeInfo?: { title?: string; pageCount?: number; imageLinks?: Record<string, string>; industryIdentifiers?: Array<{ type: string; identifier: string }> } };
 
         let bestCoverUrl: string | null = null;
+        let bestPageCount: number | null = null;
         for (const q of [`intitle:"${cleanTitle}" inauthor:${authorLastName}`, `${cleanTitle} ${cleanAuthor}`, `intitle:"${cleanTitle}"`, cleanTitle]) {
           const res = await fetch(`/api/search?q=${encodeURIComponent(q.trim())}`);
           if (!res.ok) continue;
@@ -483,20 +544,32 @@ export default function ImportPage() {
           const item = items.find(i => i?.volumeInfo?.imageLinks && (i.volumeInfo.title ?? "").toLowerCase().includes(titleKeyword.toLowerCase()))
             ?? items.find(i => i?.volumeInfo?.imageLinks) ?? items[0];
           const raw = bestGoogleCover(item?.volumeInfo?.imageLinks);
-          if (raw) { bestCoverUrl = cleanCoverUrl(raw); break; }
+          if (raw) {
+            bestCoverUrl = cleanCoverUrl(raw);
+            bestPageCount = item?.volumeInfo?.pageCount ?? null;
+            break;
+          }
           if (!bestCoverUrl && item?.volumeInfo?.industryIdentifiers) {
             bestCoverUrl = await openLibraryCover(item.volumeInfo.industryIdentifiers);
-            if (bestCoverUrl) break;
+            if (bestCoverUrl) {
+              bestPageCount = item?.volumeInfo?.pageCount ?? null;
+              break;
+            }
           }
         }
-        if (bestCoverUrl) {
-          await supabase.from("books").update({ cover_url: bestCoverUrl }).eq("google_books_id", row.google_books_id);
+        const updates: Record<string, unknown> = {};
+        if (bestCoverUrl) updates.cover_url = bestCoverUrl;
+        if (bestPageCount) updates.page_count = bestPageCount;
+        if (Object.keys(updates).length > 0) {
+          await supabase.from("books").update(updates).eq("google_books_id", row.google_books_id);
         }
       } catch { /* fail silently */ }
     }
 
     setLibbyLoansSynced(loanRows.length);
     setLibbyHoldsSynced(holdRows.length);
+    setLibbyUpdated(loanUpdates.length);
+    setLibbySkipped(skipped);
     // Repack shelves so newly added books get proper shelf_number/sort_order
     await handleRepackShelves();
     setLibbyPhase("done");
@@ -546,6 +619,14 @@ export default function ImportPage() {
     setSelectedCardKey(cardKey);
     localStorage.setItem("libbyAuth", JSON.stringify({ token: libbyToken, cards, selectedCardKey: cardKey }));
 
+    // Persist token to Supabase so the morning cron job can use it
+    try {
+      await supabase.from("libby_tokens").upsert(
+        { id: 1, token: libbyToken!, updated_at: new Date().toISOString() },
+        { onConflict: "id" }
+      );
+    } catch { /* non-critical */ }
+
     await importLibbyData(
       (data.loans as ODLoan[]) ?? [],
       (data.holds as ODHold[]) ?? []
@@ -556,13 +637,29 @@ export default function ImportPage() {
     if (!libbyToken) return;
     setLibbyError(null);
     setLibbyPhase("importing");
-    const res = await fetch("/api/libby/loans", { headers: { Authorization: `Bearer ${libbyToken}` } });
-    const holdsRes = await fetch("/api/libby/holds", { headers: { Authorization: `Bearer ${libbyToken}` } });
-    const loansData = await safeJson(res);
-    const holdsData = await safeJson(holdsRes);
+
+    const res = await fetch("/api/libby/sync", { headers: { Authorization: `Bearer ${libbyToken}` } });
+    const data = await safeJson(res);
+
+    if (!res.ok) {
+      const isAuthError = res.status === 401 || res.status === 403 || (data.error as string) === "auth_expired";
+      if (isAuthError) {
+        // Token expired — clear credentials so user is prompted to reconnect
+        setLibbyToken(null);
+        setLibbyCards([]);
+        setSelectedCardKey(null);
+        localStorage.removeItem("libbyAuth");
+        setLibbyError("Your Libby session has expired. Click Connect to sync again.");
+      } else {
+        setLibbyError((data.message as string) ?? "Sync failed — could not reach Libby servers.");
+      }
+      setLibbyPhase("setup");
+      return;
+    }
+
     await importLibbyData(
-      (loansData.loans as ODLoan[]) ?? [],
-      (holdsData.holds as ODHold[]) ?? []
+      (data.loans as ODLoan[]) ?? [],
+      (data.holds as ODHold[]) ?? []
     );
   }
 
@@ -693,7 +790,8 @@ export default function ImportPage() {
     setIsbnNotFound(false);
     setIsbnAlreadyExists(false);
     try {
-      const res = await fetch(`/api/search?q=isbn:${encodeURIComponent(isbnInput.trim())}`);
+      const cleanIsbn = isbnInput.trim().replace(/-/g, "").replace(/\s/g, "");
+      const res = await fetch(`/api/search?q=isbn:${encodeURIComponent(cleanIsbn)}`);
       const data = await res.json();
       const item = data.items?.[0];
       if (!item) { setIsbnNotFound(true); return; }
@@ -731,7 +829,11 @@ export default function ImportPage() {
     }
 
     const { format, format_source } = resolveFormat(isbnFormat);
-    await supabase.from("books").insert({
+
+    // Extract series info from title before inserting
+    const parsedSeries = extractSeriesFromTitle(isbnResult.title);
+
+    const { data: inserted } = await supabase.from("books").insert({
       title: isbnResult.title,
       author: isbnResult.author,
       cover_url: isbnResult.coverUrl,
@@ -740,7 +842,30 @@ export default function ImportPage() {
       format,
       format_source,
       page_count: isbnResult.pageCount ?? null,
-    });
+      series_name: parsedSeries?.seriesName ?? null,
+      series_position: parsedSeries?.position ?? null,
+    }).select("id").single();
+
+    // Fetch better page count + series position from volumes API
+    if (inserted?.id) {
+      try {
+        const res = await fetch(`/api/books/${encodeURIComponent(isbnResult.googleBooksId)}`);
+        if (res.ok) {
+          const fetched = await res.json();
+          const dbUpdates: Record<string, unknown> = {};
+          if (!isbnResult.pageCount && fetched.pageCount) dbUpdates.page_count = fetched.pageCount;
+          if (!parsedSeries && fetched.seriesPosition != null) {
+            dbUpdates.series_position = fetched.seriesPosition;
+            const p = extractSeriesFromTitle(isbnResult.title);
+            if (p) { dbUpdates.series_name = p.seriesName; }
+          }
+          if (Object.keys(dbUpdates).length > 0) {
+            await supabase.from("books").update(dbUpdates).eq("id", inserted.id);
+          }
+        }
+      } catch { /* non-critical */ }
+    }
+
     router.push("/");
   }
 
@@ -1138,6 +1263,51 @@ export default function ImportPage() {
 
     setCoverRefreshUpdated(updated);
     setCoverRefreshing(false);
+  }
+
+  /* ── Backfill page counts ── */
+  async function handleBackfillPageCounts() {
+    setBackfillPCRunning(true);
+    setBackfillPCResult(null);
+    setBackfillPCError(null);
+    try {
+      const { data: books } = await supabase
+        .from("books")
+        .select("id, title, author, google_books_id")
+        .is("page_count", null);
+      if (!books?.length) { setBackfillPCResult(0); setBackfillPCRunning(false); return; }
+      setBackfillPCTotal(books.length);
+      setBackfillPCDone(0);
+      let updated = 0;
+      for (const book of books) {
+        let pageCount: number | null = null;
+        try {
+          // Direct volume lookup for non-Libby books
+          const gid = book.google_books_id as string | null;
+          if (gid && !gid.startsWith("OD:")) {
+            const r = await fetch(`/api/books/${encodeURIComponent(gid)}`);
+            if (r.ok) pageCount = (await r.json()).pageCount ?? null;
+          }
+          // Fall back to title+author search
+          if (!pageCount) {
+            const q = `${book.title} ${book.author ?? ""}`.trim();
+            const r = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+            if (r.ok) pageCount = (await r.json()).items?.[0]?.volumeInfo?.pageCount ?? null;
+          }
+          if (pageCount) {
+            await supabase.from("books").update({ page_count: pageCount }).eq("id", book.id);
+            updated++;
+          }
+        } catch { /* skip individual failures */ }
+        setBackfillPCDone(prev => prev + 1);
+        await new Promise(r => setTimeout(r, 200));
+      }
+      setBackfillPCResult(updated);
+    } catch (e) {
+      setBackfillPCError(String(e));
+    } finally {
+      setBackfillPCRunning(false);
+    }
   }
 
   /* ── render ── */
@@ -1941,9 +2111,19 @@ export default function ImportPage() {
                   </p>
                   <p style={{ fontFamily: "var(--font-crimson)", fontSize: "15px", color: "rgba(240,224,192,0.75)" }}>
                     {libbyLoansSynced > 0 || libbyHoldsSynced > 0
-                      ? `${libbyLoansSynced} active loan${libbyLoansSynced !== 1 ? "s" : ""} and ${libbyHoldsSynced} hold${libbyHoldsSynced !== 1 ? "s" : ""} synced from your Libby account${libbyCards.length > 1 ? ` (${libbyCards.length} library cards)` : libbyCards.length === 1 ? ` (${libbyCards[0].cardName})` : ""}.`
+                      ? `${libbyLoansSynced} new loan${libbyLoansSynced !== 1 ? "s" : ""} and ${libbyHoldsSynced} new hold${libbyHoldsSynced !== 1 ? "s" : ""} added${libbyCards.length > 1 ? ` (${libbyCards.length} library cards)` : libbyCards.length === 1 ? ` (${libbyCards[0].cardName})` : ""}.`
                       : "No new books — your library is already up to date."}
                   </p>
+                  {libbyUpdated > 0 && (
+                    <p style={{ fontFamily: "var(--font-crimson)", fontSize: "14px", color: "rgba(240,224,192,0.55)", marginTop: "4px" }}>
+                      {libbyUpdated} existing book{libbyUpdated !== 1 ? "s" : ""} updated to active loan status.
+                    </p>
+                  )}
+                  {libbySkipped > 0 && (
+                    <p style={{ fontFamily: "var(--font-crimson)", fontSize: "14px", color: "rgba(240,224,192,0.4)", marginTop: "4px" }}>
+                      {libbySkipped} book{libbySkipped !== 1 ? "s" : ""} already in library (skipped).
+                    </p>
+                  )}
                 </div>
                 <div style={{ display: "flex", gap: "10px" }}>
                   <button onClick={() => { setLibbyPhase("setup"); setLibbyError(null); }} style={GOLD_BUTTON}>
@@ -2079,6 +2259,41 @@ export default function ImportPage() {
                   }} />
                 </div>
               )}
+            </div>
+
+            {/* Backfill Page Counts */}
+            <div style={{
+              background: "rgba(255,255,255,0.02)", border: "1px solid rgba(212,168,67,0.15)",
+              borderRadius: "12px", padding: "20px 24px",
+              display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "12px",
+            }}>
+              <div>
+                <p style={{ fontFamily: "var(--font-crimson)", fontSize: "15px", color: "rgba(240,224,192,0.75)", marginBottom: "2px" }}>Backfill Page Counts</p>
+                <p style={{ fontFamily: "var(--font-crimson)", fontSize: "13px", fontStyle: "italic", color: "rgba(240,224,192,0.35)" }}>
+                  Fetch page counts from Google Books for all books currently missing them.
+                </p>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: "10px", flexShrink: 0 }}>
+                {backfillPCRunning && (
+                  <p style={{ fontFamily: "var(--font-crimson)", fontSize: "13px", color: "rgba(240,224,192,0.6)", fontStyle: "italic" }}>
+                    {backfillPCDone} / {backfillPCTotal}
+                  </p>
+                )}
+                {backfillPCResult !== null && !backfillPCRunning && (
+                  <p style={{ fontFamily: "var(--font-crimson)", fontSize: "13px", color: "rgba(109,204,154,0.85)", fontStyle: "italic" }}>
+                    ✓ Updated {backfillPCResult}
+                  </p>
+                )}
+                {backfillPCError && (
+                  <p style={{ fontFamily: "var(--font-crimson)", fontSize: "13px", color: "rgba(248,113,113,0.85)", fontStyle: "italic" }}>
+                    ⚠ {backfillPCError}
+                  </p>
+                )}
+                <button onClick={handleBackfillPageCounts} disabled={backfillPCRunning} style={GOLD_BUTTON}>
+                  {backfillPCRunning ? <Loader2 size={13} className="animate-spin" /> : null}
+                  {backfillPCRunning ? `${backfillPCDone} / ${backfillPCTotal}` : "Run"}
+                </button>
+              </div>
             </div>
 
           </div>}

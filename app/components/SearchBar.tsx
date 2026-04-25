@@ -17,6 +17,16 @@ function bestGoogleCover(imageLinks: { extraLarge?: string; large?: string; medi
   return imageLinks.extraLarge ?? imageLinks.large ?? imageLinks.medium ?? imageLinks.thumbnail ?? imageLinks.smallThumbnail;
 }
 
+function extractSeriesFromTitle(title: string): { seriesName: string; position: number } | null {
+  const m = title.match(
+    /\(([^)]+?)(?:,\s*(?:book|vol\.?|volume|part|#)?\s*)([\d.]+)\s*\)/i
+  );
+  if (!m) return null;
+  const position = parseFloat(m[2]);
+  if (isNaN(position)) return null;
+  return { seriesName: m[1].trim(), position };
+}
+
 interface GoogleBooksResult {
   id: string;
   volumeInfo: {
@@ -24,6 +34,10 @@ interface GoogleBooksResult {
     authors?: string[];
     pageCount?: number;
     imageLinks?: { extraLarge?: string; large?: string; medium?: string; thumbnail?: string; smallThumbnail?: string };
+    seriesInfo?: {
+      bookDisplayNumber?: string;
+      volumeSeries?: Array<{ seriesId?: string }>;
+    };
   };
 }
 
@@ -92,6 +106,17 @@ export default function SearchBar({ onAddBook, existingGoogleIds = [] }: SearchB
     const rawThumb = bestGoogleCover(volumeInfo.imageLinks);
     const coverUrl = rawThumb ? cleanCoverUrl(rawThumb) : undefined;
 
+    // Series position from Google Books seriesInfo
+    const rawPos = volumeInfo.seriesInfo?.bookDisplayNumber;
+    const seriesPositionFromApi = rawPos != null ? parseFloat(rawPos) : NaN;
+
+    // Series name + position from title parsing
+    const parsed = extractSeriesFromTitle(volumeInfo.title);
+
+    // Prefer API position; fall back to parsed position
+    const seriesPosition = !isNaN(seriesPositionFromApi) ? seriesPositionFromApi : parsed?.position;
+    const seriesName = parsed?.seriesName;
+
     const palette = nextPaletteEntry();
     const book: Book = {
       id: item.id,
@@ -99,6 +124,8 @@ export default function SearchBar({ onAddBook, existingGoogleIds = [] }: SearchB
       author: volumeInfo.authors?.[0] ?? "Unknown Author",
       coverUrl,
       pageCount: volumeInfo.pageCount,
+      seriesName,
+      seriesPosition,
       ...palette,
       status: "tbr-owned",
     };
