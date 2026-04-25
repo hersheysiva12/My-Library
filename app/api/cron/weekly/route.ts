@@ -215,13 +215,13 @@ async function weeklyHandler(req: Request): Promise<Response> {
     return Response.json({ error: "db_error" }, { status: 500 });
   }
 
-  const authors = [
-    ...new Set(
+  const authors = Array.from(
+    new Set(
       (authorRows ?? [])
         .map((r: { author: string | null }) => r.author?.trim())
         .filter((a): a is string => Boolean(a))
-    ),
-  ];
+    )
+  );
 
   if (authors.length === 0) {
     return Response.json({ sent: false, reason: "no_authors" });
