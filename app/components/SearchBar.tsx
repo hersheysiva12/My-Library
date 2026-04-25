@@ -3,28 +3,49 @@
 import { useEffect, useRef, useState } from "react";
 import { Search, Plus, Loader2 } from "lucide-react";
 import { Book } from "@/app/types";
+import { gradientPalette } from "@/lib/gradients";
+
+function cleanCoverUrl(raw: string): string {
+  return raw
+    .replace(/^http:\/\//, "https://")
+    .replace(/&edge=curl/g, "")
+    .replace(/&source=gbs_api/g, "");
+}
+
+function bestGoogleCover(imageLinks: { extraLarge?: string; large?: string; medium?: string; thumbnail?: string; smallThumbnail?: string } | undefined): string | undefined {
+  if (!imageLinks) return undefined;
+  return imageLinks.extraLarge ?? imageLinks.large ?? imageLinks.medium ?? imageLinks.thumbnail ?? imageLinks.smallThumbnail;
+}
+
+function extractSeriesFromTitle(title: string): { seriesName: string; position: number } | null {
+  const m = title.match(
+    /\(([^)]+?)(?:,\s*(?:book|vol\.?|volume|part|#)?\s*)([\d.]+)\s*\)/i
+  );
+  if (!m) return null;
+  const position = parseFloat(m[2]);
+  if (isNaN(position)) return null;
+  return { seriesName: m[1].trim(), position };
+}
 
 interface GoogleBooksResult {
   id: string;
   volumeInfo: {
     title: string;
     authors?: string[];
-    imageLinks?: { thumbnail?: string; smallThumbnail?: string };
+    pageCount?: number;
+    imageLinks?: { extraLarge?: string; large?: string; medium?: string; thumbnail?: string; smallThumbnail?: string };
+    seriesInfo?: {
+      bookDisplayNumber?: string;
+      volumeSeries?: Array<{ seriesId?: string }>;
+    };
   };
 }
 
 interface SearchBarProps {
   onAddBook: (book: Book) => void;
+  /** Google Books IDs already in the library — shown as already added. */
+  existingGoogleIds?: string[];
 }
-
-// Cycles through a palette of cover styles for API results that have no cover image
-const gradientPalette = [
-  { coverGradient: "linear-gradient(160deg, #4a1942 0%, #2d0d2a 40%, #6b2560 100%)", glowColor: "rgba(140,40,150,0.7)", spineColor: "#4a1942", accentColor: "#e879f9" },
-  { coverGradient: "linear-gradient(160deg, #1a3a4a 0%, #0d2030 40%, #1e4f6b 100%)", glowColor: "rgba(30,100,160,0.7)", spineColor: "#1a3a4a", accentColor: "#7dd3fc" },
-  { coverGradient: "linear-gradient(160deg, #2d3a0d 0%, #1a2206 40%, #3d5010 100%)", glowColor: "rgba(80,140,20,0.7)", spineColor: "#2d3a0d", accentColor: "#a3e635" },
-  { coverGradient: "linear-gradient(160deg, #4a2a0d 0%, #2d1806 40%, #6b3e10 100%)", glowColor: "rgba(160,90,20,0.7)", spineColor: "#4a2a0d", accentColor: "#fdba74" },
-  { coverGradient: "linear-gradient(160deg, #0d2a3a 0%, #061820 40%, #0f3d52 100%)", glowColor: "rgba(20,100,130,0.7)", spineColor: "#0d2a3a", accentColor: "#5eead4" },
-];
 
 let paletteIndex = 0;
 function nextPaletteEntry() {
@@ -33,9 +54,10 @@ function nextPaletteEntry() {
   return entry;
 }
 
-export default function SearchBar({ onAddBook }: SearchBarProps) {
+export default function SearchBar({ onAddBook, existingGoogleIds = [] }: SearchBarProps) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<GoogleBooksResult[]>([]);
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isOpen, setIsOpen] = useState(false);
   const [addedIds, setAddedIds] = useState<Set<string>>(new Set());
@@ -56,10 +78,19 @@ export default function SearchBar({ onAddBook }: SearchBarProps) {
     if (!query.trim()) return;
     setIsLoading(true);
     setIsOpen(true);
+    setSearchError(null);
     try {
       const res = await fetch(`/api/search?q=${encodeURIComponent(query.trim())}`);
       const data = await res.json();
-      setResults(data.items ?? []);
+      if (!res.ok) {
+        setSearchError(data.message ?? "Search unavailable — try again shortly.");
+        setResults([]);
+      } else {
+        setResults(data.items ?? []);
+      }
+    } catch {
+      setSearchError("Could not reach the search service.");
+      setResults([]);
     } finally {
       setIsLoading(false);
     }
@@ -72,9 +103,19 @@ export default function SearchBar({ onAddBook }: SearchBarProps) {
 
   function handleAdd(item: GoogleBooksResult) {
     const { volumeInfo } = item;
-    const rawThumb = volumeInfo.imageLinks?.thumbnail ?? volumeInfo.imageLinks?.smallThumbnail;
-    // Upgrade to https to avoid mixed-content warnings
-    const coverUrl = rawThumb ? rawThumb.replace(/^http:\/\//, "https://") : undefined;
+    const rawThumb = bestGoogleCover(volumeInfo.imageLinks);
+    const coverUrl = rawThumb ? cleanCoverUrl(rawThumb) : undefined;
+
+    // Series position from Google Books seriesInfo
+    const rawPos = volumeInfo.seriesInfo?.bookDisplayNumber;
+    const seriesPositionFromApi = rawPos != null ? parseFloat(rawPos) : NaN;
+
+    // Series name + position from title parsing
+    const parsed = extractSeriesFromTitle(volumeInfo.title);
+
+    // Prefer API position; fall back to parsed position
+    const seriesPosition = !isNaN(seriesPositionFromApi) ? seriesPositionFromApi : parsed?.position;
+    const seriesName = parsed?.seriesName;
 
     const palette = nextPaletteEntry();
     const book: Book = {
@@ -82,8 +123,11 @@ export default function SearchBar({ onAddBook }: SearchBarProps) {
       title: volumeInfo.title,
       author: volumeInfo.authors?.[0] ?? "Unknown Author",
       coverUrl,
+      pageCount: volumeInfo.pageCount,
+      seriesName,
+      seriesPosition,
       ...palette,
-      status: "tbr",
+      status: "tbr-owned",
     };
     onAddBook(book);
     setAddedIds((prev) => new Set(prev).add(item.id));
@@ -107,7 +151,7 @@ export default function SearchBar({ onAddBook }: SearchBarProps) {
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={handleKeyDown}
           onFocus={() => results.length > 0 && setIsOpen(true)}
-          placeholder="Search for a book… press Enter"
+          placeholder="Search by title or author… press Enter"
           className="flex-1 bg-transparent outline-none text-sm placeholder:opacity-40"
           style={{
             fontFamily: "var(--font-crimson)",
@@ -135,6 +179,10 @@ export default function SearchBar({ onAddBook }: SearchBarProps) {
               <Loader2 className="w-4 h-4 animate-spin" />
               <span style={{ fontFamily: "var(--font-crimson)", fontSize: "0.9rem" }}>Searching the archives…</span>
             </div>
+          ) : searchError ? (
+            <div className="py-6 text-center px-4" style={{ fontFamily: "var(--font-crimson)", color: "#f5e6c8", fontSize: "0.9rem" }}>
+              <span style={{ opacity: 0.7 }}>⚠ {searchError}</span>
+            </div>
           ) : results.length === 0 ? (
             <div className="py-6 text-center opacity-40" style={{ fontFamily: "var(--font-crimson)", color: "#f5e6c8", fontSize: "0.9rem" }}>
               No tomes found.
@@ -142,9 +190,9 @@ export default function SearchBar({ onAddBook }: SearchBarProps) {
           ) : (
             results.map((item) => {
               const { volumeInfo } = item;
-              const thumb = volumeInfo.imageLinks?.smallThumbnail?.replace(/^http:\/\//, "https://");
+              const thumb = bestGoogleCover(volumeInfo.imageLinks) ? cleanCoverUrl(bestGoogleCover(volumeInfo.imageLinks)!) : undefined;
               const author = volumeInfo.authors?.[0] ?? "Unknown Author";
-              const added = addedIds.has(item.id);
+              const added = addedIds.has(item.id) || existingGoogleIds.includes(item.id);
 
               return (
                 <div
@@ -189,7 +237,7 @@ export default function SearchBar({ onAddBook }: SearchBarProps) {
                     </p>
                   </div>
 
-                  {/* Add button */}
+                  {/* Add / Already added button */}
                   <button
                     className="shrink-0 w-6 h-6 rounded-full flex items-center justify-center transition-all"
                     style={{
